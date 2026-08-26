@@ -1,0 +1,15 @@
+#version 450
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1, std430) readonly buffer B { float b[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer R { float result; };
+
+layout(push_constant) uniform Params { uint count; } params;
+
+void main() {
+    float sum = 0.0;
+    for (uint i = 0u; i < params.count; ++i) sum += a[i] * b[i];
+    result = sum;
+}

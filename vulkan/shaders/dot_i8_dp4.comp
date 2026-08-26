@@ -1,0 +1,31 @@
+#version 450
+
+// One invocation computes one packed four-lane dot product. The host selects
+// this shader only when integer dot-product support is actually discovered.
+layout(local_size_x = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer PackedA { uint a[]; };
+layout(std430, set = 0, binding = 1) readonly buffer PackedB { uint b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Result { int result[]; };
+
+layout(push_constant) uniform Params {
+    uint packed_words;
+} params;
+
+int signed_byte(uint word, uint lane) {
+    uint value = (word >> (lane * 8u)) & 255u;
+    return value < 128u ? int(value) : int(value) - 256;
+}
+
+void main() {
+    int sum = 0;
+    for (uint i = 0u; i < params.packed_words; ++i) {
+        uint av = a[i];
+        uint bv = b[i];
+        sum += signed_byte(av, 0u) * signed_byte(bv, 0u);
+        sum += signed_byte(av, 1u) * signed_byte(bv, 1u);
+        sum += signed_byte(av, 2u) * signed_byte(bv, 2u);
+        sum += signed_byte(av, 3u) * signed_byte(bv, 3u);
+    }
+    result[0] = sum;
+}

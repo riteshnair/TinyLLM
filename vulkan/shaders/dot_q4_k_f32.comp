@@ -1,0 +1,49 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Native GGML Q4_K dot: 256 values / 144 bytes per super-block.
+// Bindings: 0 = packed Q4_K bytes, 1 = F32 input, 2 = one F32 result.
+// This is a deliberately simple reference kernel with no matrix extension path.
+layout(push_constant) uniform PC { uint num_blocks; } pc;
+layout(scalar, set = 0, binding = 0) readonly buffer Packed { uint8_t raw[]; } packed;
+layout(scalar, set = 0, binding = 1) readonly buffer Input { float values[]; } input_data;
+layout(scalar, set = 0, binding = 2) writeonly buffer Output { float result; } output_data;
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+void unpack_scale_min(uint index, uint base, out uint scale, out uint minimum) {
+    if (index < 4u) {
+        scale = uint(packed.raw[base + index]) & 63u;
+        minimum = uint(packed.raw[base + index + 4u]) & 63u;
+    } else {
+        scale = (uint(packed.raw[base + index + 4u]) & 15u) |
+                ((uint(packed.raw[base + index - 4u]) >> 6u) << 4u);
+        minimum = (uint(packed.raw[base + index + 4u]) >> 4u) |
+                  ((uint(packed.raw[base + index]) >> 6u) << 4u);
+    }
+}
+
+void main() {
+    float sum = 0.0;
+    for (uint block = 0u; block < pc.num_blocks; ++block) {
+        uint base = block * 144u;
+        uint d_bits = uint(packed.raw[base]) | (uint(packed.raw[base + 1u]) << 8u);
+        uint dm_bits = uint(packed.raw[base + 2u]) | (uint(packed.raw[base + 3u]) << 8u);
+        float d = unpackHalf2x16(d_bits).x;
+        float dm = unpackHalf2x16(dm_bits).x;
+        for (uint group = 0u; group < 4u; ++group) {
+            uint sc = 0u; uint mn = 0u;
+            unpack_scale_min(group * 2u, base + 4u, sc, mn);
+            float d1 = d * float(sc); float m1 = dm * float(mn);
+            unpack_scale_min(group * 2u + 1u, base + 4u, sc, mn);
+            float d2 = d * float(sc); float m2 = dm * float(mn);
+            for (uint i = 0u; i < 32u; ++i) {
+                uint q = uint(packed.raw[base + 16u + group * 32u + i]);
+                sum += (d1 * float(q & 15u) - m1) * input_data.values[block * 256u + group * 64u + i];
+                sum += (d2 * float(q >> 4u) - m2) * input_data.values[block * 256u + group * 64u + 32u + i];
+            }
+        }
+    }
+    output_data.result = sum;
+}
+
