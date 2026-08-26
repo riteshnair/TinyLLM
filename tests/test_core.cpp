@@ -1922,6 +1922,17 @@ static void test_prefix_cache() {
     lm_prefix_cache_stats stats{};
     assert(lm_prefix_cache_get_stats(cache, &stats) == LM_OK);
     assert(stats.entries == 2u && stats.hits == 1u && stats.misses == 2u && stats.evictions == 1u);
+    size_t serialized_bytes = 0u;
+    assert(lm_prefix_cache_export_size(cache, &serialized_bytes) == LM_OK && serialized_bytes > 16u);
+    std::vector<unsigned char> serialized(serialized_bytes);
+    assert(lm_prefix_cache_export(cache, serialized.data(), serialized.size(), &serialized_bytes) == LM_OK);
+    lm_prefix_cache *restored = nullptr;
+    assert(lm_prefix_cache_create(2u, 8u, &restored) == LM_OK);
+    assert(lm_prefix_cache_import(restored, serialized.data(), serialized.size()) == LM_OK);
+    assert(lm_prefix_cache_lookup(restored, 11u, 22u, other, 1u, &page, &prefix_tokens) == LM_OK && page == 12u);
+    serialized[0] = 'X';
+    assert(lm_prefix_cache_import(restored, serialized.data(), serialized.size()) == LM_ERR_PARSE);
+    lm_prefix_cache_destroy(restored);
     assert(lm_prefix_cache_erase_page(cache, 9u) == LM_OK);
     assert(lm_prefix_cache_get_stats(cache, &stats) == LM_OK && stats.entries == 1u);
     lm_prefix_cache_destroy(cache);

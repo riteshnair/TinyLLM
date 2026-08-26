@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <vector>
 
@@ -14,6 +15,26 @@ struct PrefixEntry {
     uint32_t page_id;
     std::vector<uint32_t> tokens;
 };
+
+void put32(unsigned char *out, uint32_t value) {
+    for (uint32_t i = 0u; i < 4u; ++i) out[i] = static_cast<unsigned char>(value >> (i * 8u));
+}
+
+void put64(unsigned char *out, uint64_t value) {
+    for (uint32_t i = 0u; i < 8u; ++i) out[i] = static_cast<unsigned char>(value >> (i * 8u));
+}
+
+uint32_t get32(const unsigned char *data) {
+    uint32_t value = 0u;
+    for (uint32_t i = 0u; i < 4u; ++i) value |= static_cast<uint32_t>(data[i]) << (i * 8u);
+    return value;
+}
+
+uint64_t get64(const unsigned char *data) {
+    uint64_t value = 0u;
+    for (uint32_t i = 0u; i < 8u; ++i) value |= static_cast<uint64_t>(data[i]) << (i * 8u);
+    return value;
+}
 
 } // namespace
 
@@ -116,5 +137,78 @@ lm_status lm_prefix_cache_erase_page(lm_prefix_cache *cache, uint32_t page_id) {
 lm_status lm_prefix_cache_get_stats(const lm_prefix_cache *cache, lm_prefix_cache_stats *out_stats) {
     if (!cache || !out_stats) return LM_ERR_ARGUMENT;
     *out_stats = cache->stats;
+    return LM_OK;
+}
+
+lm_status lm_prefix_cache_export_size(const lm_prefix_cache *cache, size_t *out_bytes) {
+    if (!cache || !out_bytes) return LM_ERR_ARGUMENT;
+    size_t total = 16u;
+    for (const PrefixEntry &entry : cache->entries) {
+        if (entry.tokens.size() > (std::numeric_limits<size_t>::max() - total - 24u) / sizeof(uint32_t))
+            return LM_ERR_CAPACITY;
+        total += 24u + entry.tokens.size() * sizeof(uint32_t);
+    }
+    *out_bytes = total;
+    return LM_OK;
+}
+
+lm_status lm_prefix_cache_export(const lm_prefix_cache *cache, void *out_data,
+                                 size_t data_capacity, size_t *out_bytes) {
+    if (!cache || !out_bytes) return LM_ERR_ARGUMENT;
+    size_t required = 0u;
+    const lm_status sized = lm_prefix_cache_export_size(cache, &required);
+    if (sized != LM_OK) return sized;
+    *out_bytes = required;
+    if (!out_data || data_capacity < required) return LM_ERR_CAPACITY;
+    unsigned char *cursor = static_cast<unsigned char *>(out_data);
+    std::memcpy(cursor, "TLPFX001", 8u);
+    put32(cursor + 8u, 1u);
+    put32(cursor + 12u, static_cast<uint32_t>(cache->entries.size()));
+    cursor += 16u;
+    for (const PrefixEntry &entry : cache->entries) {
+        put64(cursor, entry.model_identity);
+        put64(cursor + 8u, entry.settings_identity);
+        put32(cursor + 16u, entry.page_id);
+        put32(cursor + 20u, static_cast<uint32_t>(entry.tokens.size()));
+        cursor += 24u;
+        for (uint32_t token : entry.tokens) { put32(cursor, token); cursor += 4u; }
+    }
+    return LM_OK;
+}
+
+lm_status lm_prefix_cache_import(lm_prefix_cache *cache, const void *data, size_t data_bytes) {
+    if (!cache || !data || data_bytes < 16u) return LM_ERR_ARGUMENT;
+    const unsigned char *cursor = static_cast<const unsigned char *>(data);
+    if (std::memcmp(cursor, "TLPFX001", 8u) != 0 || get32(cursor + 8u) != 1u) return LM_ERR_PARSE;
+    const uint32_t count = get32(cursor + 12u);
+    if (count > cache->max_entries) return LM_ERR_CAPACITY;
+    cursor += 16u;
+    size_t remaining = data_bytes - 16u;
+    std::vector<PrefixEntry> imported;
+    try { imported.reserve(count); } catch (const std::bad_alloc &) { return LM_ERR_CAPACITY; }
+    for (uint32_t i = 0u; i < count; ++i) {
+        if (remaining < 24u) return LM_ERR_PARSE;
+        const uint64_t model_identity = get64(cursor);
+        const uint64_t settings_identity = get64(cursor + 8u);
+        const uint32_t page_id = get32(cursor + 16u);
+        const uint32_t token_count = get32(cursor + 20u);
+        cursor += 24u; remaining -= 24u;
+        if (token_count == 0u || token_count > cache->max_tokens ||
+            token_count > remaining / sizeof(uint32_t)) return LM_ERR_PARSE;
+        PrefixEntry entry{model_identity, settings_identity, static_cast<uint64_t>(i + 1u), page_id, {}};
+        try { entry.tokens.assign(reinterpret_cast<const uint32_t *>(cursor),
+                                  reinterpret_cast<const uint32_t *>(cursor) + token_count); }
+        catch (const std::bad_alloc &) { return LM_ERR_CAPACITY; }
+        imported.push_back(std::move(entry));
+        cursor += static_cast<size_t>(token_count) * sizeof(uint32_t);
+        remaining -= static_cast<size_t>(token_count) * sizeof(uint32_t);
+    }
+    if (remaining != 0u) return LM_ERR_PARSE;
+    cache->entries.swap(imported);
+    cache->clock = count;
+    cache->stats.entries = count;
+    cache->stats.hits = 0u;
+    cache->stats.misses = 0u;
+    cache->stats.evictions = 0u;
     return LM_OK;
 }

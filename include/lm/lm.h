@@ -948,6 +948,10 @@ lm_status lm_prefix_cache_lookup(lm_prefix_cache *cache, uint64_t model_identity
                                  size_t *out_prefix_tokens);
 lm_status lm_prefix_cache_erase_page(lm_prefix_cache *cache, uint32_t page_id);
 lm_status lm_prefix_cache_get_stats(const lm_prefix_cache *cache, lm_prefix_cache_stats *out_stats);
+lm_status lm_prefix_cache_export_size(const lm_prefix_cache *cache, size_t *out_bytes);
+lm_status lm_prefix_cache_export(const lm_prefix_cache *cache, void *out_data,
+                                 size_t data_capacity, size_t *out_bytes);
+lm_status lm_prefix_cache_import(lm_prefix_cache *cache, const void *data, size_t data_bytes);
 
 typedef struct lm_batch_scheduler lm_batch_scheduler;
 typedef struct lm_batch_scheduler_stats {
