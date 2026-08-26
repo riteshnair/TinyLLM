@@ -105,6 +105,16 @@ typedef struct lm_file_span {
 
 lm_status lm_file_span_make(lm_file *file, uint64_t offset, uint64_t bytes, lm_file_span *out_span);
 lm_status lm_file_span_read(const lm_file_span *span, uint64_t offset, void *dst, size_t bytes);
+typedef struct lm_file_window lm_file_window;
+lm_status lm_file_window_create(lm_file *file, uint64_t window_bytes, lm_file_window **out_window);
+void lm_file_window_destroy(lm_file_window *window);
+lm_status lm_file_window_prefetch(lm_file_window *window, uint64_t offset, uint64_t bytes);
+lm_status lm_file_window_read(lm_file_window *window, uint64_t offset, void *dst, size_t bytes);
+typedef struct lm_file_shard_set lm_file_shard_set;
+lm_status lm_file_shard_set_open(const char *const *paths, size_t count, lm_file_shard_set **out_set);
+void lm_file_shard_set_close(lm_file_shard_set *set);
+lm_status lm_file_shard_set_size(const lm_file_shard_set *set, uint64_t *out_bytes);
+lm_status lm_file_shard_set_read(lm_file_shard_set *set, uint64_t offset, void *dst, size_t bytes);
 
 
 typedef enum lm_dtype {

@@ -168,7 +168,7 @@ static void test_file_access() {
     assert(lm_file_open(path, &file) == LM_OK);
     uint64_t size = 0u;
     assert(lm_file_size(file, &size) == LM_OK && size == 10u);
-    char readback[5] = {};
+    char readback[8] = {};
     assert(lm_file_read(file, 3u, readback, 4u) == LM_OK);
     assert(std::memcmp(readback, "3456", 4u) == 0);
     lm_file_span span{};
@@ -179,8 +179,37 @@ static void test_file_access() {
     assert(lm_file_span_read(&span, 2u, readback, 4u) == LM_ERR_RANGE);
     assert(lm_file_read(file, size, nullptr, 0u) == LM_OK);
     assert(lm_file_read(file, 8u, readback, 4u) == LM_ERR_RANGE);
+    lm_file_window *window = nullptr;
+    assert(lm_file_window_create(file, 4u, &window) == LM_OK);
+    assert(lm_file_window_prefetch(window, 2u, 4u) == LM_OK);
+    std::memset(readback, 0, sizeof(readback));
+    assert(lm_file_window_read(window, 3u, readback, 3u) == LM_OK);
+    assert(std::memcmp(readback, "345", 3u) == 0);
+    assert(lm_file_window_read(window, 0u, readback, 5u) == LM_ERR_CAPACITY);
+    assert(lm_file_window_prefetch(window, 8u, 4u) == LM_ERR_RANGE);
+    lm_file_window_destroy(window);
     lm_file_close(file);
+    const char *shard_a = "test-file-a.bin";
+    const char *shard_b = "test-file-b.bin";
+    {
+        std::ofstream first(shard_a, std::ios::binary);
+        std::ofstream second(shard_b, std::ios::binary);
+        first.write("0123", 4);
+        second.write("456789", 6);
+    }
+    const char *shard_paths[] = {shard_a, shard_b};
+    lm_file_shard_set *shards = nullptr;
+    assert(lm_file_shard_set_open(shard_paths, 2u, &shards) == LM_OK);
+    uint64_t shard_size = 0u;
+    assert(lm_file_shard_set_size(shards, &shard_size) == LM_OK && shard_size == 10u);
+    std::memset(readback, 0, sizeof(readback));
+    assert(lm_file_shard_set_read(shards, 2u, readback, 6u) == LM_OK);
+    assert(std::memcmp(readback, "234567", 6u) == 0);
+    assert(lm_file_shard_set_read(shards, 8u, readback, 3u) == LM_ERR_RANGE);
+    lm_file_shard_set_close(shards);
     std::remove(path);
+    std::remove(shard_a);
+    std::remove(shard_b);
 }
 
 static void test_native_model_tensor_binding() {
