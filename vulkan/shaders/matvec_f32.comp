@@ -1,0 +1,18 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+
+layout(push_constant) uniform PC { uint rows; uint columns; } pc;
+layout(scalar, set = 0, binding = 0) readonly buffer Matrix { float values[]; } matrix_data;
+layout(scalar, set = 0, binding = 1) readonly buffer Input { float values[]; } input_data;
+layout(scalar, set = 0, binding = 2) writeonly buffer Output { float values[]; } output_data;
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.rows) return;
+    float sum = 0.0;
+    uint base = row * pc.columns;
+    for (uint column = 0u; column < pc.columns; ++column)
+        sum += matrix_data.values[base + column] * input_data.values[column];
+    output_data.values[row] = sum;
+}

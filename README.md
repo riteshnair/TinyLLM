@@ -4,11 +4,11 @@ TinyLLM is a compact, Vulkan-first modular LLM inference engine with a strict C9
 
 ## Current validated slice
 
-The repository currently provides bounded GGUF/SafeTensors inspection, exact native GGML Q4_0/Q8_0/Q4_K storage contracts, SafeTensors metadata and contiguous token-string contracts, demand-paged file-span bindings, replaceable Vulkan packed and F32 scalar dot/matvec shaders, paged KV metadata plus bounded opaque payloads with copy-on-write, deterministic sampling, and a narrow native multi-layer path.
+The repository currently provides bounded GGUF/SafeTensors inspection, exact native GGML Q4_0/Q8_0/Q4_K storage contracts, SafeTensors metadata and contiguous token-string contracts, demand-paged file-span bindings, replaceable Vulkan packed and F32 scalar dot/matvec shaders, reusable Vulkan F32 and packed dispatch contexts with grow-only buffers, paged KV metadata plus bounded opaque payloads with copy-on-write, deterministic sampling, and a narrow native multi-layer path.
 
 The narrow GGUF path validates a multi-layer Llama metadata profile with two query heads and one KV head when every layer satisfies the same explicit shape and native-format contract; executes native Q8_0 MLP and attention operations; uses an explicit F32 KV payload per layer; produces logits; encodes a bounded prompt; and runs a bounded deterministic generation loop. SafeTensors additionally supports metadata-bound Llama scalar architecture, contiguous `tokenizer.token.N` vocabulary entries, exact F32 caller-scratch matrices, scalar Vulkan F32 matvec differentials, and CPU transformer/numeric-token generation. These are real tested vertical slices, not arbitrary-checkpoint compatibility.
 
-The engine deliberately returns named unsupported errors for capabilities outside the validated profiles. Architecture families beyond the bounded Llama scalar contract, BPE/merge tokenizer semantics, tokenizer.json parsing, quantized KV policy, persistent device residency, sharding/prefetch scheduling, full MoE graph/router integration, batching, streaming, server/WebUI integration, distributed execution, and future ROCr/HSA backends remain pending.
+The engine deliberately returns named unsupported errors for capabilities outside the validated profiles. Architecture families beyond the bounded Llama scalar contract, BPE/merge tokenizer semantics, tokenizer.json parsing, quantized KV policy, packed model-graph device residency, sharding/prefetch scheduling, heterogeneous MoE formats, batching, streaming, server/WebUI integration, distributed execution, and future ROCr/HSA backends remain pending.
 
 ## Build
 
@@ -57,6 +57,8 @@ The CLI accepts the narrow validated multi-layer GGUF profile and checks every l
 | `vulkan/device.cpp` | Vulkan device discovery |
 | `vulkan/dp4.cpp` | Reference packed-int8 DP4 dispatch |
 | `vulkan/matvec_f32.cpp` | SafeTensors F32 scalar Vulkan matvec route |
+| `vulkan/f32_context.cpp` | Reusable F32 Vulkan dispatch context |
+| `vulkan/packed_context.cpp` | Reusable Q4_K/Q8_0 Vulkan dispatch context |
 | `vulkan/shaders/dot_i8_dp4.comp` | DP4 compute shader source |
 | `cli/main.cpp` | Local control CLI, device listing, and narrow multi-layer generation entrypoint |
 | `tests/test_core.cpp` | Focused unit and smoke tests |

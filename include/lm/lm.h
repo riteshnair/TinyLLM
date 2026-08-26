@@ -248,6 +248,23 @@ lm_status lm_vulkan_matvec_f32(const char *spv_path, uint32_t device_index,
                                const float *matrix, uint32_t rows,
                                uint32_t columns, const float *input,
                                float *out);
+typedef struct lm_vulkan_f32_context lm_vulkan_f32_context;
+lm_status lm_vulkan_f32_context_create(const char *spv_path, uint32_t device_index,
+                                       lm_vulkan_f32_context **out_context);
+void lm_vulkan_f32_context_destroy(lm_vulkan_f32_context *context);
+lm_status lm_vulkan_f32_context_matvec(lm_vulkan_f32_context *context,
+                                       const float *matrix, uint32_t rows,
+                                       uint32_t columns, const float *input,
+                                       float *out);
+typedef struct lm_vulkan_packed_context lm_vulkan_packed_context;
+lm_status lm_vulkan_packed_context_create(const char *spv_path, uint32_t device_index,
+                                          uint32_t block_bytes, uint32_t block_values,
+                                          lm_vulkan_packed_context **out_context);
+void lm_vulkan_packed_context_destroy(lm_vulkan_packed_context *context);
+lm_status lm_vulkan_packed_context_matvec(lm_vulkan_packed_context *context,
+                                          const void *packed, uint32_t rows,
+                                          uint32_t blocks_per_row, const float *input,
+                                          float *out);
 typedef struct lm_kv_cache lm_kv_cache;
 
 typedef struct lm_kv_stats {
@@ -308,6 +325,7 @@ typedef struct lm_native_matvec_config {
     lm_backend_kind backend;
     uint32_t device_index;
     const char *shader_path; /* required for Vulkan; ignored by CPU */
+    void *vulkan_context; /* optional reusable backend context; ignored by CPU */
 } lm_native_matvec_config;
 
 lm_status lm_model_open(const char *path, lm_model_file **out_model, char *error_text, size_t error_capacity);

@@ -293,7 +293,7 @@ static void test_native_model_tensor_binding() {
                                                    sizeof(bound_q8_scratch), 1u, 32u,
                                                    bound_q8_input, q8_matrix_cpu) == LM_OK);
     assert(q8_matrix_cpu[0] == bound_q8_cpu);
-    lm_native_matvec_config native_cpu{LM_BACKEND_CPU, 0u, nullptr};
+    lm_native_matvec_config native_cpu{LM_BACKEND_CPU, 0u, nullptr, nullptr};
     float native_cpu_output[1] = {};
     assert(lm_model_tensor_matvec_native(model, 1u, &native_cpu, bound_q8_scratch,
                                          sizeof(bound_q8_scratch), 1u, 32u,
@@ -306,12 +306,31 @@ static void test_native_model_tensor_binding() {
                                                           "matvec_q8_0_f32.comp.spv", 0u,
                                                           bound_q8_input, q8_matrix_vulkan) == LM_OK);
         assert(q8_matrix_vulkan[0] == q8_matrix_cpu[0]);
-        lm_native_matvec_config native_vulkan{LM_BACKEND_VULKAN, 0u, "matvec_q8_0_f32.comp.spv"};
+        lm_native_matvec_config native_vulkan{LM_BACKEND_VULKAN, 0u, "matvec_q8_0_f32.comp.spv", nullptr};
         float native_vulkan_output[1] = {};
         assert(lm_model_tensor_matvec_native(model, 1u, &native_vulkan, bound_q8_scratch,
                                              sizeof(bound_q8_scratch), 1u, 32u,
                                              bound_q8_input, native_vulkan_output) == LM_OK);
         assert(native_vulkan_output[0] == q8_matrix_cpu[0]);
+#if LM_HAS_VULKAN
+        lm_vulkan_packed_context *packed_context = nullptr;
+        assert(lm_vulkan_packed_context_create("matvec_q8_0_f32.comp.spv", 0u, 34u, 32u, &packed_context) == LM_OK);
+        native_vulkan.vulkan_context = packed_context;
+        float reusable_output[1] = {};
+        assert(lm_model_tensor_matvec_native(model, 1u, &native_vulkan, bound_q8_scratch,
+                                             sizeof(bound_q8_scratch), 1u, 32u,
+                                             bound_q8_input, reusable_output) == LM_OK);
+        assert(reusable_output[0] == q8_matrix_cpu[0]);
+        assert(lm_model_tensor_matvec_native(model, 1u, &native_vulkan, bound_q8_scratch,
+                                             sizeof(bound_q8_scratch), 1u, 32u,
+                                             bound_q8_input, reusable_output) == LM_OK);
+        lm_vulkan_packed_context_destroy(packed_context);
+#endif
+    } else {
+#if !LM_HAS_VULKAN
+        lm_vulkan_packed_context *packed_context = nullptr;
+        assert(lm_vulkan_packed_context_create("matvec_q8_0_f32.comp.spv", 0u, 34u, 32u, &packed_context) == LM_ERR_UNSUPPORTED);
+#endif
     }
     lm_model_tensor_binding q4_k_binding{};
     assert(lm_model_tensor_bind_native(model, 2u, &q4_k_binding) == LM_OK);
@@ -345,6 +364,17 @@ static void test_native_model_tensor_binding() {
                                                           "matvec_q4_k_f32.comp.spv", 0u,
                                                           matrix_input, matrix_vulkan) == LM_OK);
         assert(matrix_vulkan[0] == matrix_cpu[0]);
+#if LM_HAS_VULKAN
+        lm_vulkan_packed_context *packed_q4_context = nullptr;
+        assert(lm_vulkan_packed_context_create("matvec_q4_k_f32.comp.spv", 0u, 144u, 256u, &packed_q4_context) == LM_OK);
+        float reusable_q4[1] = {};
+        assert(lm_vulkan_packed_context_matvec(packed_q4_context, bound_q4_k, 1u, 1u,
+                                               matrix_input, reusable_q4) == LM_OK);
+        assert(reusable_q4[0] == matrix_cpu[0]);
+        assert(lm_vulkan_packed_context_matvec(packed_q4_context, bound_q4_k, 1u, 1u,
+                                               matrix_input, reusable_q4) == LM_OK);
+        lm_vulkan_packed_context_destroy(packed_q4_context);
+#endif
     }
     assert(lm_model_tensor_binding_view(&q4_binding, q4_bytes, sizeof(q4_bytes) - 1u, &q4_tensor) == LM_ERR_CAPACITY);
     lm_model_close(model);
@@ -579,7 +609,7 @@ static void test_safetensors_native_mlp() {
     assert(lm_model_token_decode(model, encoded, encoded_count, decoded, sizeof(decoded), &decoded_bytes) == LM_OK &&
            decoded_bytes == 2u && std::memcmp(decoded, text, 2u) == 0);
     lm_native_mlp_config config{};
-    config.matvec = {LM_BACKEND_CPU, 0u, nullptr};
+    config.matvec = {LM_BACKEND_CPU, 0u, nullptr, nullptr};
     config.layer_index = 0u;
     config.vocab_size = 2u;
     config.hidden_size = 2u;
@@ -601,6 +631,17 @@ static void test_safetensors_native_mlp() {
            std::fabs(backend_logits[1] - logits[1]) < 1.0e-5f);
 #else
     assert(lm_model_execute_native_mlp_logits(model, &graph, &bad_backend, 0u, scratch, sizeof(scratch), backend_logits, 2u) == LM_ERR_UNSUPPORTED);
+#endif
+#if LM_HAS_VULKAN
+    lm_vulkan_f32_context *context = nullptr;
+    assert(lm_vulkan_f32_context_create("matvec_f32.comp.spv", 0u, &context) == LM_OK);
+    bad_backend.matvec.vulkan_context = context;
+    float reused_logits[2] = {};
+    assert(lm_model_execute_native_mlp_logits(model, &graph, &bad_backend, 0u, scratch, sizeof(scratch), reused_logits, 2u) == LM_OK);
+    assert(std::fabs(reused_logits[0] - logits[0]) < 1.0e-5f &&
+           std::fabs(reused_logits[1] - logits[1]) < 1.0e-5f);
+    assert(lm_model_execute_native_mlp_logits(model, &graph, &bad_backend, 0u, scratch, sizeof(scratch), reused_logits, 2u) == LM_OK);
+    lm_vulkan_f32_context_destroy(context);
 #endif
     lm_native_transformer_config transformer{};
     transformer.step.matvec = config.matvec;
@@ -848,7 +889,7 @@ static void test_native_mlp_profile() {
            architecture.head_count_kv == 1u && architecture.intermediate_length == intermediate &&
            architecture.rope_frequency_base == 10000.0f);
     lm_native_mlp_config config{};
-    config.matvec = {LM_BACKEND_CPU, 0u, nullptr};
+    config.matvec = {LM_BACKEND_CPU, 0u, nullptr, nullptr};
     config.layer_index = 0u;
     config.vocab_size = vocab;
     config.hidden_size = hidden;
@@ -899,7 +940,7 @@ static void test_native_mlp_profile() {
     assert(lm_vulkan_device_count(&devices) == LM_OK || devices == 0u);
     if (devices != 0u) {
         lm_native_attention_config vulkan_attention = attention;
-        vulkan_attention.matvec = {LM_BACKEND_VULKAN, 0u, "matvec_q8_0_f32.comp.spv"};
+        vulkan_attention.matvec = {LM_BACKEND_VULKAN, 0u, "matvec_q8_0_f32.comp.spv", nullptr};
         float vulkan_attention_output[hidden] = {};
         assert(lm_model_execute_native_attention(model, &graph, &vulkan_attention, attention_input,
                                                   kv, page, scratch, sizeof(scratch),
@@ -958,7 +999,7 @@ static void test_native_mlp_profile() {
                                     sizeof(scratch), generated, 3u, &generated_count) == LM_ERR_RANGE);
     if (lm_vulkan_device_count(&devices) == LM_OK && devices != 0u) {
         lm_native_mlp_config vulkan_config = config;
-        vulkan_config.matvec = {LM_BACKEND_VULKAN, 0u, "matvec_q8_0_f32.comp.spv"};
+        vulkan_config.matvec = {LM_BACKEND_VULKAN, 0u, "matvec_q8_0_f32.comp.spv", nullptr};
         std::fill(logits, logits + vocab, 0.0f);
         assert(lm_model_execute_native_mlp_logits(model, &graph, &vulkan_config, 0u, scratch,
                                                   sizeof(scratch), logits, vocab) == LM_OK);

@@ -1328,6 +1328,17 @@ lm_status lm_model_tensor_matvec_native(const lm_model_file *model, uint64_t ten
         if (backend == LM_BACKEND_CPU)
             return lm_model_tensor_binding_matvec_q4_k_cpu(&binding, packed_scratch, scratch_bytes,
                                                            rows, columns, input, out);
+        const uint64_t blocks = static_cast<uint64_t>(columns) / 256u;
+        const uint64_t expected = static_cast<uint64_t>(rows) * blocks * 144u;
+        if (binding.descriptor.rank != 2u || binding.descriptor.dims[0] != rows || binding.descriptor.dims[1] != columns ||
+            columns == 0u || columns % 256u != 0u || blocks > UINT32_MAX || expected != binding.span.bytes) return LM_ERR_RANGE;
+        if (config->vulkan_context) {
+            if (expected > scratch_bytes) return LM_ERR_CAPACITY;
+            const lm_status read = lm_file_span_read(&binding.span, 0u, packed_scratch, static_cast<size_t>(expected));
+            if (read != LM_OK) return read;
+            return lm_vulkan_packed_context_matvec(static_cast<lm_vulkan_packed_context *>(config->vulkan_context),
+                                                   packed_scratch, rows, static_cast<uint32_t>(blocks), input, out);
+        }
         if (!config->shader_path) return LM_ERR_ARGUMENT;
         return lm_model_tensor_binding_matvec_q4_k_vulkan(&binding, packed_scratch, scratch_bytes,
                                                           rows, columns, config->shader_path,
@@ -1337,6 +1348,17 @@ lm_status lm_model_tensor_matvec_native(const lm_model_file *model, uint64_t ten
         if (backend == LM_BACKEND_CPU)
             return lm_model_tensor_binding_matvec_q8_0_cpu(&binding, packed_scratch, scratch_bytes,
                                                            rows, columns, input, out);
+        const uint64_t blocks = static_cast<uint64_t>(columns) / 32u;
+        const uint64_t expected = static_cast<uint64_t>(rows) * blocks * 34u;
+        if (binding.descriptor.rank != 2u || binding.descriptor.dims[0] != rows || binding.descriptor.dims[1] != columns ||
+            columns == 0u || columns % 32u != 0u || blocks > UINT32_MAX || expected != binding.span.bytes) return LM_ERR_RANGE;
+        if (config->vulkan_context) {
+            if (expected > scratch_bytes) return LM_ERR_CAPACITY;
+            const lm_status read = lm_file_span_read(&binding.span, 0u, packed_scratch, static_cast<size_t>(expected));
+            if (read != LM_OK) return read;
+            return lm_vulkan_packed_context_matvec(static_cast<lm_vulkan_packed_context *>(config->vulkan_context),
+                                                   packed_scratch, rows, static_cast<uint32_t>(blocks), input, out);
+        }
         if (!config->shader_path) return LM_ERR_ARGUMENT;
         return lm_model_tensor_binding_matvec_q8_0_vulkan(&binding, packed_scratch, scratch_bytes,
                                                           rows, columns, config->shader_path,

@@ -153,7 +153,7 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
     }
     const char *shader = matrix_type == 8u ? "matvec_q8_0_f32.comp.spv" : "matvec_q4_k_f32.comp.spv";
     lm_native_generation_config generation{};
-    generation.step.matvec = {config.backend, config.device_index, shader};
+    generation.step.matvec = {config.backend, config.device_index, shader, nullptr};
     generation.step.layer_index = 0u;
     generation.step.vocab_size = token_count;
     generation.step.hidden_size = static_cast<uint32_t>(embedding.dims[0]);

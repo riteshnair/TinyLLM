@@ -204,6 +204,9 @@ lm_status profile_matvec(const lm_model_file *model, uint64_t index,
             if (status != LM_OK) return status;
             status = lm_file_span_read(&span, 0u, packed_scratch, static_cast<size_t>(bytes));
             if (status != LM_OK) return status;
+            if (config->vulkan_context)
+                return lm_vulkan_f32_context_matvec(static_cast<lm_vulkan_f32_context *>(config->vulkan_context),
+                                                   static_cast<const float *>(packed_scratch), rows, columns, input, out);
             return lm_vulkan_matvec_f32(config->shader_path, config->device_index,
                                         static_cast<const float *>(packed_scratch), rows, columns, input, out);
         }
