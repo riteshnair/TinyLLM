@@ -588,6 +588,8 @@ lm_status lm_model_execute_native_step(const lm_model_file *model,
 
 typedef struct lm_native_transformer_config {
     lm_native_step_config step;
+    uint8_t has_architecture;
+    lm_model_architecture architecture;
 } lm_native_transformer_config;
 
 lm_status lm_model_execute_native_transformer(const lm_model_file *model,
@@ -609,6 +611,8 @@ typedef struct lm_native_generation_config {
     uint32_t max_new_tokens;
     uint32_t stop_token;
     uint8_t has_stop_token;
+    uint8_t has_architecture;
+    lm_model_architecture architecture;
 } lm_native_generation_config;
 
 lm_status lm_model_generate_native(const lm_model_file *model,

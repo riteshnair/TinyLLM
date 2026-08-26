@@ -521,6 +521,57 @@ static void test_safetensors_native_mlp() {
     lm_native_mlp_config bad_backend = config;
     bad_backend.matvec.backend = LM_BACKEND_VULKAN;
     assert(lm_model_execute_native_mlp_logits(model, &graph, &bad_backend, 0u, scratch, sizeof(scratch), logits, 2u) == LM_ERR_UNSUPPORTED);
+    lm_native_transformer_config transformer{};
+    transformer.step.matvec = config.matvec;
+    transformer.step.layer_index = 0u;
+    transformer.step.vocab_size = 2u;
+    transformer.step.hidden_size = 2u;
+    transformer.step.intermediate_size = 2u;
+    transformer.step.head_count = 1u;
+    transformer.step.head_count_kv = 1u;
+    transformer.step.token_offset = 0u;
+    transformer.step.use_rope = 0u;
+    transformer.step.rms_epsilon = config.rms_epsilon;
+    transformer.step.matrix_format = LM_QUANT_NONE;
+    transformer.has_architecture = 1u;
+    transformer.architecture = {4u, 2u, 1u, 1u, 1u, 2u, 10000.0f};
+    lm_kv_cache *transformer_cache = nullptr;
+    lm_kv_cache *step_cache = nullptr;
+    assert(lm_kv_cache_create_with_payload(1u, 4u, 8u, 8u, &transformer_cache) == LM_OK);
+    assert(lm_kv_cache_create_with_payload(1u, 4u, 8u, 8u, &step_cache) == LM_OK);
+    uint32_t transformer_page = UINT32_MAX;
+    uint32_t step_page = UINT32_MAX;
+    assert(lm_kv_cache_append(transformer_cache, &transformer_page, 1u) == LM_OK);
+    assert(lm_kv_cache_append(step_cache, &step_page, 1u) == LM_OK);
+    lm_kv_cache *layer_caches[1] = {transformer_cache};
+    float transformer_logits[2] = {};
+    float step_logits[2] = {};
+    assert(lm_model_execute_native_transformer(model, &graph, &transformer, 0u, layer_caches, 1u,
+                                               transformer_page, scratch, sizeof(scratch),
+                                               transformer_logits, 2u) == LM_OK);
+    assert(lm_model_execute_native_step(model, &graph, &transformer.step, 0u, step_cache, step_page,
+                                        scratch, sizeof(scratch), step_logits, 2u) == LM_OK);
+    assert(std::fabs(transformer_logits[0] - step_logits[0]) < 1.0e-6f);
+    assert(std::fabs(transformer_logits[1] - step_logits[1]) < 1.0e-6f);
+    transformer.has_architecture = 0u;
+    assert(lm_model_execute_native_transformer(model, &graph, &transformer, 0u, layer_caches, 1u,
+                                               transformer_page, scratch, sizeof(scratch),
+                                               transformer_logits, 2u) == LM_ERR_UNSUPPORTED);
+    lm_native_generation_config generation{};
+    generation.step = transformer.step;
+    generation.step.token_offset = 0u;
+    generation.sampling = {LM_SAMPLING_GREEDY, 0u, 1.0f, 1u};
+    generation.max_new_tokens = 1u;
+    generation.has_architecture = 1u;
+    generation.architecture = transformer.architecture;
+    const uint32_t prompt_tokens[1] = {0u};
+    uint32_t generated_tokens[1] = {};
+    size_t generated_count = 0u;
+    assert(lm_model_generate_native(model, &graph, &generation, prompt_tokens, 1u, scratch, sizeof(scratch),
+                                    generated_tokens, 1u, &generated_count) == LM_OK);
+    assert(generated_count == 1u && generated_tokens[0] < 2u);
+    lm_kv_cache_destroy(transformer_cache);
+    lm_kv_cache_destroy(step_cache);
     lm_model_close(model);
     std::remove(path);
 }

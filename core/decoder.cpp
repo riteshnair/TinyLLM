@@ -259,8 +259,13 @@ lm_status validate_transformer_architecture(const lm_model_file *model,
                                              const lm_native_transformer_config *config) {
     if (!model || !graph || !config) return LM_ERR_ARGUMENT;
     lm_model_architecture architecture{};
-    const lm_status status = lm_model_get_architecture(model, &architecture);
-    if (status != LM_OK) return status;
+    lm_status status = lm_model_get_architecture(model, &architecture);
+    if (status != LM_OK) {
+        lm_model_info info{};
+        if (!config->has_architecture || lm_model_get_info(model, &info) != LM_OK ||
+            info.format != LM_MODEL_SAFETENSORS) return status;
+        architecture = config->architecture;
+    }
     if (architecture.block_count != graph->layer_count ||
         architecture.embedding_length != config->step.hidden_size ||
         architecture.intermediate_length != config->step.intermediate_size ||
@@ -597,7 +602,8 @@ lm_status lm_model_execute_native_transformer(const lm_model_file *model,
         config->step.hidden_size > kNativeProfileMaxHidden ||
         config->step.intermediate_size > kNativeProfileMaxIntermediate ||
         !(config->step.rms_epsilon > 0.0f) || !std::isfinite(config->step.rms_epsilon) ||
-        (config->step.matrix_format != LM_QUANT_GGML_Q8_0 &&
+        (config->step.matrix_format != LM_QUANT_NONE &&
+         config->step.matrix_format != LM_QUANT_GGML_Q8_0 &&
          config->step.matrix_format != LM_QUANT_GGML_Q4_K))
         return LM_ERR_ARGUMENT;
     const lm_status architecture_status = validate_transformer_architecture(model, graph, config);
@@ -731,6 +737,8 @@ lm_status lm_model_generate_native(const lm_model_file *model,
     if (status == LM_OK) {
         lm_native_transformer_config transformer{};
         transformer.step = config->step;
+        transformer.has_architecture = config->has_architecture;
+        transformer.architecture = config->architecture;
         for (size_t i = 0u; i < prompt_count; ++i) {
             for (uint32_t layer = 0u; layer < graph->layer_count; ++layer) {
                 uint32_t page_id = page_live[layer] == 0u ? UINT32_MAX : 0u;
