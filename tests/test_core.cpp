@@ -393,6 +393,48 @@ static void test_native_model_tensor_binding() {
     std::remove(bad_path);
 }
 
+static void test_safetensors_native_mlp() {
+    const char *path = "test-native-f32.safetensors";
+    const char *json = "{\"token_embd.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,16]},\"output.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[16,32]},\"output_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[32,40]},\"blk.0.attn_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[40,48]},\"blk.0.attn_q.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[48,64]},\"blk.0.attn_k.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[64,80]},\"blk.0.attn_v.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[80,96]},\"blk.0.attn_output.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[96,112]},\"blk.0.ffn_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[112,120]},\"blk.0.ffn_gate.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[120,136]},\"blk.0.ffn_down.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[136,152]},\"blk.0.ffn_up.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[152,168]}}";
+    {
+        std::ofstream file(path, std::ios::binary);
+        const uint64_t header_bytes = std::strlen(json);
+        file.write(reinterpret_cast<const char *>(&header_bytes), sizeof(header_bytes));
+        file.write(json, static_cast<std::streamsize>(header_bytes));
+        std::vector<float> payload(42u, 0.0f);
+        payload[0] = 1.0f; payload[3] = 1.0f;
+        payload[4] = 1.0f; payload[7] = 1.0f;
+        for (uint32_t i = 0u; i < 2u; ++i) payload[8u + i] = 1.0f;
+        for (uint32_t i = 0u; i < 2u; ++i) payload[10u + i] = 1.0f;
+        payload[22] = 1.0f; payload[25] = 1.0f;
+        payload[34] = 1.0f; payload[37] = 1.0f;
+        file.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size() * sizeof(float)));
+    }
+    char error[128] = {};
+    lm_model_file *model = nullptr;
+    assert(lm_model_open(path, &model, error, sizeof(error)) == LM_OK);
+    lm_decoder_graph_binding graph{};
+    assert(lm_model_build_llama_graph(model, &graph) == LM_OK && graph.layer_count == 1u);
+    lm_native_mlp_config config{};
+    config.matvec = {LM_BACKEND_CPU, 0u, nullptr};
+    config.layer_index = 0u;
+    config.vocab_size = 2u;
+    config.hidden_size = 2u;
+    config.intermediate_size = 2u;
+    config.matrix_format = LM_QUANT_NONE;
+    config.rms_epsilon = 1.0e-5f;
+    unsigned char scratch[256] = {};
+    float logits[2] = {};
+    assert(lm_model_execute_native_mlp_logits(model, &graph, &config, 0u, scratch, sizeof(scratch), logits, 2u) == LM_OK);
+    const float scale = 1.0f / std::sqrt(0.5f + config.rms_epsilon);
+    assert(std::fabs(logits[0] - scale) < 1.0e-5f && std::fabs(logits[1]) < 1.0e-5f);
+    lm_native_mlp_config bad_backend = config;
+    bad_backend.matvec.backend = LM_BACKEND_VULKAN;
+    assert(lm_model_execute_native_mlp_logits(model, &graph, &bad_backend, 0u, scratch, sizeof(scratch), logits, 2u) == LM_ERR_UNSUPPORTED);
+    lm_model_close(model);
+    std::remove(path);
+}
+
 static void test_native_mlp_profile() {
     auto put_u32 = [](std::vector<unsigned char> *bytes, uint32_t value) {
         for (unsigned i = 0u; i < 4u; ++i) bytes->push_back(static_cast<unsigned char>((value >> (8u * i)) & 0xffu));
@@ -419,29 +461,29 @@ static void test_native_mlp_profile() {
         cursor += bytes;
     };
     const uint32_t vocab = 32u;
-    const uint32_t hidden = 32u;
+    const uint32_t hidden = 64u;
     const uint32_t intermediate = 64u;
     add("token_embd.weight", 8u, 2u, hidden, vocab, static_cast<uint64_t>(hidden) * 34u);
-    add("output.weight", 8u, 2u, vocab, hidden, static_cast<uint64_t>(vocab) * 34u);
+    add("output.weight", 8u, 2u, vocab, hidden, static_cast<uint64_t>(vocab) * 68u);
     add("output_norm.weight", LM_DTYPE_F32, 1u, hidden, 0u, hidden * sizeof(float));
     add("blk.0.attn_norm.weight", LM_DTYPE_F32, 1u, hidden, 0u, hidden * sizeof(float));
-    add("blk.0.attn_q.weight", 8u, 2u, hidden, hidden, static_cast<uint64_t>(hidden) * 34u);
-    add("blk.0.attn_k.weight", 8u, 2u, hidden, hidden, static_cast<uint64_t>(hidden) * 34u);
-    add("blk.0.attn_v.weight", 8u, 2u, hidden, hidden, static_cast<uint64_t>(hidden) * 34u);
-    add("blk.0.attn_output.weight", 8u, 2u, hidden, hidden, static_cast<uint64_t>(hidden) * 34u);
+    add("blk.0.attn_q.weight", 8u, 2u, hidden, hidden, static_cast<uint64_t>(hidden) * 68u);
+    add("blk.0.attn_k.weight", 8u, 2u, hidden / 2u, hidden, static_cast<uint64_t>(hidden / 2u) * 68u);
+    add("blk.0.attn_v.weight", 8u, 2u, hidden / 2u, hidden, static_cast<uint64_t>(hidden / 2u) * 68u);
+    add("blk.0.attn_output.weight", 8u, 2u, hidden, hidden, static_cast<uint64_t>(hidden) * 68u);
     add("blk.0.ffn_norm.weight", LM_DTYPE_F32, 1u, hidden, 0u, hidden * sizeof(float));
-    add("blk.0.ffn_gate.weight", 8u, 2u, intermediate, hidden, static_cast<uint64_t>(intermediate) * 34u);
+    add("blk.0.ffn_gate.weight", 8u, 2u, intermediate, hidden, static_cast<uint64_t>(intermediate) * 68u);
     add("blk.0.ffn_down.weight", 8u, 2u, hidden, intermediate, static_cast<uint64_t>(hidden) * 68u);
-    add("blk.0.ffn_up.weight", 8u, 2u, intermediate, hidden, static_cast<uint64_t>(intermediate) * 34u);
+    add("blk.0.ffn_up.weight", 8u, 2u, intermediate, hidden, static_cast<uint64_t>(intermediate) * 68u);
     add("blk.1.attn_norm.weight", LM_DTYPE_F32, 1u, hidden, 0u, hidden * sizeof(float));
-    add("blk.1.attn_q.weight", 8u, 2u, hidden, hidden, static_cast<uint64_t>(hidden) * 34u);
-    add("blk.1.attn_k.weight", 8u, 2u, hidden, hidden, static_cast<uint64_t>(hidden) * 34u);
-    add("blk.1.attn_v.weight", 8u, 2u, hidden, hidden, static_cast<uint64_t>(hidden) * 34u);
-    add("blk.1.attn_output.weight", 8u, 2u, hidden, hidden, static_cast<uint64_t>(hidden) * 34u);
+    add("blk.1.attn_q.weight", 8u, 2u, hidden, hidden, static_cast<uint64_t>(hidden) * 68u);
+    add("blk.1.attn_k.weight", 8u, 2u, hidden / 2u, hidden, static_cast<uint64_t>(hidden / 2u) * 68u);
+    add("blk.1.attn_v.weight", 8u, 2u, hidden / 2u, hidden, static_cast<uint64_t>(hidden / 2u) * 68u);
+    add("blk.1.attn_output.weight", 8u, 2u, hidden, hidden, static_cast<uint64_t>(hidden) * 68u);
     add("blk.1.ffn_norm.weight", LM_DTYPE_F32, 1u, hidden, 0u, hidden * sizeof(float));
-    add("blk.1.ffn_gate.weight", 8u, 2u, intermediate, hidden, static_cast<uint64_t>(intermediate) * 34u);
+    add("blk.1.ffn_gate.weight", 8u, 2u, intermediate, hidden, static_cast<uint64_t>(intermediate) * 68u);
     add("blk.1.ffn_down.weight", 8u, 2u, hidden, intermediate, static_cast<uint64_t>(hidden) * 68u);
-    add("blk.1.ffn_up.weight", 8u, 2u, intermediate, hidden, static_cast<uint64_t>(intermediate) * 34u);
+    add("blk.1.ffn_up.weight", 8u, 2u, intermediate, hidden, static_cast<uint64_t>(intermediate) * 68u);
 
     std::vector<unsigned char> gguf(24u, 0u);
     gguf[0] = 'G'; gguf[1] = 'G'; gguf[2] = 'U'; gguf[3] = 'F';
@@ -472,7 +514,7 @@ static void test_native_mlp_profile() {
     put_key_u32("llama.context_length", 4096u);
     put_key_u32("llama.embedding_length", hidden);
     put_key_u32("llama.block_count", 2u);
-    put_key_u32("llama.attention.head_count", 1u);
+    put_key_u32("llama.attention.head_count", 2u);
     put_key_u32("llama.attention.head_count_kv", 1u);
     put_key_u32("llama.feed_forward_length", intermediate);
     put_key_f32("llama.rope.freq_base", 10000.0f);
@@ -502,31 +544,35 @@ static void test_native_mlp_profile() {
     const size_t header_size = (gguf.size() + 31u) & ~static_cast<size_t>(31u);
     gguf.resize(header_size + static_cast<size_t>(cursor), 0u);
     const auto payload = [&gguf, header_size](uint64_t offset) { return gguf.data() + header_size + offset; };
-    const auto fill_q8 = [&payload](uint64_t offset, uint32_t rows, const auto &row_value) {
+    const auto fill_q8 = [&payload](uint64_t offset, uint32_t rows, uint32_t columns, const auto &row_value) {
+        const uint32_t blocks = columns / 32u;
         for (uint32_t row = 0u; row < rows; ++row) {
-            unsigned char *base = payload(offset) + static_cast<size_t>(row) * 34u;
-            base[1] = 0x3cu;
-            for (uint32_t i = 0u; i < 32u; ++i) base[2u + i] = row_value(row);
+            unsigned char *row_base = payload(offset) + static_cast<size_t>(row) * blocks * 34u;
+            for (uint32_t block = 0u; block < blocks; ++block) {
+                unsigned char *base = row_base + static_cast<size_t>(block) * 34u;
+                base[1] = 0x3cu;
+                for (uint32_t i = 0u; i < 32u; ++i) base[2u + i] = row_value(row);
+            }
         }
     };
-    fill_q8(specs[0].offset, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
-    fill_q8(specs[1].offset, vocab, [](uint32_t row) {
+    fill_q8(specs[0].offset, hidden, vocab, [](uint32_t) { return static_cast<unsigned char>(1u); });
+    fill_q8(specs[1].offset, vocab, hidden, [](uint32_t row) {
         return row == 0u ? static_cast<unsigned char>(1u) : (row == 1u ? static_cast<unsigned char>(2u) : static_cast<unsigned char>(0u));
     });
-    fill_q8(specs[4].offset, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
-    fill_q8(specs[5].offset, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
-    fill_q8(specs[6].offset, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
-    fill_q8(specs[7].offset, hidden, [](uint32_t row) { return row == 0u ? static_cast<unsigned char>(1u) : static_cast<unsigned char>(0u); });
-    fill_q8(specs[13].offset, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
-    fill_q8(specs[14].offset, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
-    fill_q8(specs[15].offset, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
-    fill_q8(specs[16].offset, hidden, [](uint32_t row) { return row == 0u ? static_cast<unsigned char>(1u) : static_cast<unsigned char>(0u); });
-    fill_q8(specs[18].offset, intermediate, [](uint32_t) { return static_cast<unsigned char>(1u); });
-    fill_q8(specs[19].offset, hidden, [](uint32_t) { return static_cast<unsigned char>(0u); });
-    fill_q8(specs[20].offset, intermediate, [](uint32_t) { return static_cast<unsigned char>(1u); });
-    fill_q8(specs[9].offset, intermediate, [](uint32_t) { return static_cast<unsigned char>(1u); });
-    fill_q8(specs[10].offset, hidden, [](uint32_t) { return static_cast<unsigned char>(0u); });
-    fill_q8(specs[11].offset, intermediate, [](uint32_t) { return static_cast<unsigned char>(1u); });
+    fill_q8(specs[4].offset, hidden, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
+    fill_q8(specs[5].offset, hidden / 2u, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
+    fill_q8(specs[6].offset, hidden / 2u, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
+    fill_q8(specs[7].offset, hidden, hidden, [](uint32_t row) { return row == 0u ? static_cast<unsigned char>(1u) : static_cast<unsigned char>(0u); });
+    fill_q8(specs[13].offset, hidden, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
+    fill_q8(specs[14].offset, hidden / 2u, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
+    fill_q8(specs[15].offset, hidden / 2u, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
+    fill_q8(specs[16].offset, hidden, hidden, [](uint32_t row) { return row == 0u ? static_cast<unsigned char>(1u) : static_cast<unsigned char>(0u); });
+    fill_q8(specs[18].offset, intermediate, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
+    fill_q8(specs[19].offset, hidden, intermediate, [](uint32_t) { return static_cast<unsigned char>(0u); });
+    fill_q8(specs[20].offset, intermediate, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
+    fill_q8(specs[9].offset, intermediate, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
+    fill_q8(specs[10].offset, hidden, intermediate, [](uint32_t) { return static_cast<unsigned char>(0u); });
+    fill_q8(specs[11].offset, intermediate, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
     for (uint32_t i = 0u; i < hidden; ++i) {
         float one = 1.0f;
         std::memcpy(payload(specs[2].offset) + i * sizeof(float), &one, sizeof(one));
@@ -549,7 +595,7 @@ static void test_native_mlp_profile() {
     lm_model_architecture architecture{};
     assert(lm_model_get_architecture(model, &architecture) == LM_OK);
     assert(architecture.context_length == 4096u && architecture.embedding_length == hidden &&
-           architecture.block_count == 2u && architecture.head_count == 1u &&
+           architecture.block_count == 2u && architecture.head_count == 2u &&
            architecture.head_count_kv == 1u && architecture.intermediate_length == intermediate &&
            architecture.rope_frequency_base == 10000.0f);
     lm_native_mlp_config config{};
@@ -560,27 +606,29 @@ static void test_native_mlp_profile() {
     config.intermediate_size = intermediate;
     config.matrix_format = LM_QUANT_GGML_Q8_0;
     config.rms_epsilon = 1.0e-5f;
-    unsigned char scratch[2176] = {};
+    unsigned char scratch[8192] = {};
     float logits[vocab] = {};
     assert(lm_model_execute_native_mlp_logits(model, &graph, &config, 0u, scratch, sizeof(scratch),
                                               logits, vocab) == LM_OK);
     const float expected_scale = 1.0f / std::sqrt(1.0f + config.rms_epsilon);
-    assert(std::fabs(logits[0] - 32.0f * expected_scale) < 1.0e-4f);
-    assert(std::fabs(logits[1] - 64.0f * expected_scale) < 1.0e-4f);
+    assert(std::fabs(logits[0] - 64.0f * expected_scale) < 1.0e-4f);
+    assert(std::fabs(logits[1] - 128.0f * expected_scale) < 1.0e-4f);
     assert(logits[2] == 0.0f);
     lm_kv_cache *kv = nullptr;
-    assert(lm_kv_cache_create_with_payload(1u, 2u, hidden * sizeof(float),
-                                           hidden * sizeof(float), &kv) == LM_OK);
+    assert(lm_kv_cache_create_with_payload(1u, 2u, (hidden / 2u) * sizeof(float),
+                                           (hidden / 2u) * sizeof(float), &kv) == LM_OK);
     uint32_t page = UINT32_MAX;
     assert(lm_kv_cache_append(kv, &page, 1u) == LM_OK);
     uint32_t key_bytes = 0u;
     uint32_t value_bytes = 0u;
     assert(lm_kv_cache_get_payload_layout(kv, &key_bytes, &value_bytes) == LM_OK);
-    assert(key_bytes == hidden * sizeof(float) && value_bytes == hidden * sizeof(float));
+    assert(key_bytes == (hidden / 2u) * sizeof(float) && value_bytes == (hidden / 2u) * sizeof(float));
     lm_native_attention_config attention{};
     attention.matvec = config.matvec;
     attention.layer_index = 0u;
     attention.hidden_size = hidden;
+    attention.head_count = 2u;
+    attention.head_count_kv = 1u;
     attention.token_offset = 0u;
     attention.rms_epsilon = config.rms_epsilon;
     attention.matrix_format = LM_QUANT_GGML_Q8_0;
@@ -590,14 +638,14 @@ static void test_native_mlp_profile() {
     assert(lm_model_execute_native_attention(model, &graph, &attention, attention_input, kv, page,
                                               scratch, sizeof(scratch), attention_output) == LM_OK);
     const float attention_scale = 1.0f / std::sqrt(1.0f + 1.0e-5f);
-    assert(std::fabs(attention_output[0] - (1.0f + 1024.0f * attention_scale)) < 1.0e-3f);
+    assert(std::fabs(attention_output[0] - (1.0f + 4096.0f * attention_scale)) < 1.0e-2f);
     for (uint32_t i = 1u; i < hidden; ++i) assert(attention_output[i] == 1.0f);
     assert(lm_kv_cache_append(kv, &page, 1u) == LM_OK);
     attention.token_offset = 1u;
     std::fill(attention_output, attention_output + hidden, 0.0f);
     assert(lm_model_execute_native_attention(model, &graph, &attention, attention_input, kv, page,
                                               scratch, sizeof(scratch), attention_output) == LM_OK);
-    assert(std::fabs(attention_output[0] - (1.0f + 1024.0f * attention_scale)) < 1.0e-3f);
+    assert(std::fabs(attention_output[0] - (1.0f + 4096.0f * attention_scale)) < 1.0e-2f);
     uint32_t devices = 0u;
     assert(lm_vulkan_device_count(&devices) == LM_OK || devices == 0u);
     if (devices != 0u) {
@@ -624,6 +672,8 @@ static void test_native_mlp_profile() {
     generation.step.vocab_size = vocab;
     generation.step.hidden_size = hidden;
     generation.step.intermediate_size = intermediate;
+    generation.step.head_count = 2u;
+    generation.step.head_count_kv = 1u;
     generation.step.use_rope = 0u;
     generation.step.rope_theta = 0.0f;
     generation.step.rms_epsilon = config.rms_epsilon;
@@ -663,8 +713,8 @@ static void test_native_mlp_profile() {
         std::fill(logits, logits + vocab, 0.0f);
         assert(lm_model_execute_native_mlp_logits(model, &graph, &vulkan_config, 0u, scratch,
                                                   sizeof(scratch), logits, vocab) == LM_OK);
-        assert(std::fabs(logits[0] - 32.0f * expected_scale) < 1.0e-4f);
-        assert(std::fabs(logits[1] - 64.0f * expected_scale) < 1.0e-4f);
+        assert(std::fabs(logits[0] - 64.0f * expected_scale) < 1.0e-4f);
+        assert(std::fabs(logits[1] - 128.0f * expected_scale) < 1.0e-4f);
     }
     lm_model_close(model);
     std::remove(path);
@@ -1279,6 +1329,7 @@ int main() {
     test_native_mlp_profile();
     test_model_and_cpu_math();
     test_safetensors_parser();
+    test_safetensors_native_mlp();
     test_tokenizer();
     test_sampling();
     test_cpu_decoder();

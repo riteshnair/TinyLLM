@@ -536,11 +536,13 @@ lm_status lm_model_execute_native_mlp_logits(const lm_model_file *model,
                                              float *out_logits,
                                              size_t logits_count);
 
-/* Narrow attention: one head, equal query/KV width, caller-appended token slot, F32 KV payload. */
+/* Narrow attention: explicit validated head counts, caller-appended token slot, F32 KV payload. */
 typedef struct lm_native_attention_config {
     lm_native_matvec_config matvec;
     uint32_t layer_index;
     uint32_t hidden_size;
+    uint32_t head_count;
+    uint32_t head_count_kv;
     uint32_t token_offset;
     uint8_t use_rope;
     float rope_theta;
@@ -564,6 +566,8 @@ typedef struct lm_native_step_config {
     uint32_t vocab_size;
     uint32_t hidden_size;
     uint32_t intermediate_size;
+    uint32_t head_count;
+    uint32_t head_count_kv;
     uint32_t token_offset;
     uint8_t use_rope;
     float rope_theta;

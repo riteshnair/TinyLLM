@@ -51,6 +51,15 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
         return lm_model_tensor_info_at(model, index, out);
     };
     lm_model_tensor_info embedding{}, output{}, gate{}, up{}, down{}, ffn_norm{}, output_norm{};
+    lm_model_architecture architecture{};
+    if (lm_model_get_architecture(model, &architecture) != LM_OK || architecture.block_count != graph.layer_count ||
+        architecture.embedding_length == 0u || architecture.intermediate_length == 0u ||
+        architecture.head_count == 0u || architecture.head_count_kv == 0u ||
+        architecture.head_count_kv > architecture.head_count ||
+        architecture.head_count % architecture.head_count_kv != 0u) {
+        lm_model_close(model);
+        return LM_ERR_UNSUPPORTED;
+    }
     const lm_decoder_layer_binding &layer = graph.layers[0];
     const uint64_t indices[] = {graph.token_embedding, graph.output, layer.ffn_gate,
                                 layer.ffn_up, layer.ffn_down};
@@ -65,6 +74,7 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
     if (status != LM_OK) { lm_model_close(model); return status; }
     if (embedding.rank != 2u || output.rank != 2u || gate.rank != 2u || up.rank != 2u || down.rank != 2u ||
         embedding.dims[1] != output.dims[0] || embedding.dims[0] != output.dims[1] ||
+        embedding.dims[0] != architecture.embedding_length || gate.dims[0] != architecture.intermediate_length ||
         gate.dims[1] != embedding.dims[0] || up.dims[1] != embedding.dims[0] ||
         down.dims[1] != gate.dims[0] || down.dims[0] != embedding.dims[0] ||
         ffn_norm.rank != 1u || output_norm.rank != 1u || ffn_norm.dims[0] != embedding.dims[0] ||
@@ -113,6 +123,9 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
     generation.step.vocab_size = token_count;
     generation.step.hidden_size = static_cast<uint32_t>(embedding.dims[0]);
     generation.step.intermediate_size = static_cast<uint32_t>(gate.dims[0]);
+    generation.step.head_count = architecture.head_count;
+    generation.step.head_count_kv = architecture.head_count_kv;
+    generation.step.use_rope = 0u;
     generation.step.rms_epsilon = 1.0e-5f;
     generation.step.matrix_format = matrix_type == 8u ? LM_QUANT_GGML_Q8_0 : LM_QUANT_GGML_Q4_K;
     generation.sampling = {LM_SAMPLING_GREEDY, 0u, 1.0f, 1u};

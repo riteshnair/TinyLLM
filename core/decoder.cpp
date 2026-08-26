@@ -140,12 +140,23 @@ lm_status profile_matrix(const lm_model_file *model, uint64_t index,
                         uint32_t rows, uint32_t columns, lm_quant_format format,
                         uint64_t *payload_bytes) {
     if (!model || !payload_bytes || rows == 0u || columns == 0u) return LM_ERR_ARGUMENT;
+    lm_model_tensor_info descriptor{};
+    const lm_status described = lm_model_tensor_info_at(model, index, &descriptor);
+    if (described != LM_OK) return described;
+    if (descriptor.rank != 2u || descriptor.dims[0] != rows || descriptor.dims[1] != columns)
+        return LM_ERR_UNSUPPORTED;
+    if (format == LM_QUANT_NONE) {
+        if (descriptor.type != LM_DTYPE_F32 || static_cast<uint64_t>(rows) > UINT64_MAX / columns)
+            return LM_ERR_UNSUPPORTED;
+        const uint64_t elements = static_cast<uint64_t>(rows) * columns;
+        if (elements > UINT64_MAX / sizeof(float)) return LM_ERR_CAPACITY;
+        *payload_bytes = elements * sizeof(float);
+        return LM_OK;
+    }
     lm_model_tensor_binding binding{};
     const lm_status bound = lm_model_tensor_bind_native(model, index, &binding);
     if (bound != LM_OK) return bound;
-    if (binding.quant_format != format || binding.descriptor.rank != 2u ||
-        binding.descriptor.dims[0] != rows || binding.descriptor.dims[1] != columns)
-        return LM_ERR_UNSUPPORTED;
+    if (binding.quant_format != format) return LM_ERR_UNSUPPORTED;
     *payload_bytes = binding.span.bytes;
     return LM_OK;
 }
@@ -176,6 +187,15 @@ lm_status profile_matvec(const lm_model_file *model, uint64_t index,
                          const lm_native_matvec_config *config, void *packed_scratch,
                          uint64_t packed_scratch_bytes, uint32_t rows, uint32_t columns,
                          const float *input, float *out) {
+    if (!config) return LM_ERR_ARGUMENT;
+    lm_model_tensor_info descriptor{};
+    const lm_status described = lm_model_tensor_info_at(model, index, &descriptor);
+    if (described != LM_OK) return described;
+    if (descriptor.type == LM_DTYPE_F32) {
+        if (config->backend == LM_BACKEND_VULKAN) return LM_ERR_UNSUPPORTED;
+        return lm_model_tensor_matvec_f32_cpu(model, index, packed_scratch, packed_scratch_bytes,
+                                              rows, columns, input, out);
+    }
     return lm_model_tensor_matvec_native(model, index, config, packed_scratch,
                                          packed_scratch_bytes, rows, columns, input, out);
 }
@@ -244,7 +264,12 @@ lm_status validate_transformer_architecture(const lm_model_file *model,
     if (architecture.block_count != graph->layer_count ||
         architecture.embedding_length != config->step.hidden_size ||
         architecture.intermediate_length != config->step.intermediate_size ||
-        architecture.head_count != 1u || architecture.head_count_kv != 1u ||
+        architecture.head_count != config->step.head_count ||
+        architecture.head_count_kv != config->step.head_count_kv ||
+        architecture.head_count == 0u || architecture.head_count_kv == 0u ||
+        architecture.head_count_kv > architecture.head_count ||
+        architecture.head_count % architecture.head_count_kv != 0u ||
+        architecture.embedding_length % architecture.head_count != 0u ||
         architecture.context_length == 0u || config->step.token_offset >= architecture.context_length)
         return LM_ERR_UNSUPPORTED;
     if (config->step.use_rope != 0u &&
@@ -270,7 +295,8 @@ lm_status lm_model_execute_native_mlp_logits(const lm_model_file *model,
         config->intermediate_size > kNativeProfileMaxIntermediate || token_id >= config->vocab_size ||
         logits_count < config->vocab_size || !(config->rms_epsilon > 0.0f) ||
         !std::isfinite(config->rms_epsilon) ||
-        (config->matrix_format != LM_QUANT_GGML_Q8_0 && config->matrix_format != LM_QUANT_GGML_Q4_K))
+        (config->matrix_format != LM_QUANT_NONE && config->matrix_format != LM_QUANT_GGML_Q8_0 &&
+         config->matrix_format != LM_QUANT_GGML_Q4_K))
         return LM_ERR_ARGUMENT;
     const lm_decoder_layer_binding &layer = graph->layers[config->layer_index];
     uint64_t max_payload = 0u;
@@ -359,24 +385,34 @@ lm_status lm_model_execute_native_attention(const lm_model_file *model,
                                             float *out_attention) {
     if (!model || !graph || !config || !input || !kv_cache || !packed_scratch || !out_attention ||
         config->layer_index >= graph->layer_count || config->hidden_size == 0u ||
-        config->hidden_size > kNativeProfileMaxHidden || config->token_offset >= (1u << 20u) ||
-        (config->matrix_format != LM_QUANT_GGML_Q8_0 && config->matrix_format != LM_QUANT_GGML_Q4_K) ||
+        config->hidden_size > kNativeProfileMaxHidden || config->head_count == 0u ||
+        config->head_count_kv == 0u || config->head_count_kv > config->head_count ||
+        config->head_count % config->head_count_kv != 0u || config->hidden_size % config->head_count != 0u ||
+        config->token_offset >= (1u << 20u) ||
+        (config->matrix_format != LM_QUANT_NONE && config->matrix_format != LM_QUANT_GGML_Q8_0 &&
+         config->matrix_format != LM_QUANT_GGML_Q4_K) ||
         (config->use_rope && (!(config->rope_theta > 1.0f) || !std::isfinite(config->rope_theta))) ||
         !(config->rms_epsilon > 0.0f) || !std::isfinite(config->rms_epsilon) ||
         !finite_array(input, config->hidden_size))
         return LM_ERR_ARGUMENT;
+    const uint32_t head_dim = config->hidden_size / config->head_count;
+    const uint32_t kv_width = head_dim * config->head_count_kv;
     uint32_t key_bytes = 0u;
     uint32_t value_bytes = 0u;
     lm_status status = lm_kv_cache_get_payload_layout(kv_cache, &key_bytes, &value_bytes);
     if (status != LM_OK) return status;
-    if (key_bytes != config->hidden_size * sizeof(float) || value_bytes != config->hidden_size * sizeof(float))
+    if (key_bytes != kv_width * sizeof(float) || value_bytes != kv_width * sizeof(float))
         return LM_ERR_UNSUPPORTED;
     const lm_decoder_layer_binding &layer = graph->layers[config->layer_index];
-    const uint64_t matrix_indices[] = {layer.attn_q, layer.attn_k, layer.attn_v, layer.attn_output};
     uint64_t max_payload = 0u;
-    for (const uint64_t index : matrix_indices) {
+    const uint32_t matrix_rows[] = {config->hidden_size, kv_width,
+                                    kv_width, config->hidden_size};
+    const uint32_t matrix_columns[] = {config->hidden_size, config->hidden_size,
+                                       config->hidden_size, config->hidden_size};
+    const uint64_t matrix_indices[] = {layer.attn_q, layer.attn_k, layer.attn_v, layer.attn_output};
+    for (uint32_t i = 0u; i < 4u; ++i) {
         uint64_t payload = 0u;
-        status = profile_matrix(model, index, config->hidden_size, config->hidden_size,
+        status = profile_matrix(model, matrix_indices[i], matrix_rows[i], matrix_columns[i],
                                 config->matrix_format, &payload);
         if (status != LM_OK) return status;
         if (payload > max_payload) max_payload = payload;
@@ -386,13 +422,13 @@ lm_status lm_model_execute_native_attention(const lm_model_file *model,
     try {
         norm.assign(config->hidden_size, 0.0f);
         q.assign(config->hidden_size, 0.0f);
-        k.assign(config->hidden_size, 0.0f);
-        v.assign(config->hidden_size, 0.0f);
+        k.assign(kv_width, 0.0f);
+        v.assign(kv_width, 0.0f);
         projected.assign(config->hidden_size, 0.0f);
         attended.assign(config->hidden_size, 0.0f);
         const size_t context = static_cast<size_t>(config->token_offset) + 1u;
-        keys.assign(context * config->hidden_size, 0.0f);
-        values.assign(context * config->hidden_size, 0.0f);
+        keys.assign(context * kv_width, 0.0f);
+        values.assign(context * kv_width, 0.0f);
         scores.assign(context, 0.0f);
         weights.assign(context, 0.0f);
     } catch (const std::bad_alloc &) {
@@ -413,34 +449,40 @@ lm_status lm_model_execute_native_attention(const lm_model_file *model,
                             config->hidden_size, norm.data(), q.data());
     if (status != LM_OK) return status;
     status = profile_matvec(model, layer.attn_k, &config->matvec,
-                            packed_scratch, packed_scratch_bytes, config->hidden_size,
+                            packed_scratch, packed_scratch_bytes, kv_width,
                             config->hidden_size, norm.data(), k.data());
     if (status != LM_OK) return status;
     status = profile_matvec(model, layer.attn_v, &config->matvec,
-                            packed_scratch, packed_scratch_bytes, config->hidden_size,
+                            packed_scratch, packed_scratch_bytes, kv_width,
                             config->hidden_size, norm.data(), v.data());
     if (status != LM_OK) return status;
     if (config->use_rope) {
         apply_rope(q.data(), config->hidden_size, config->token_offset, config->rope_theta);
-        apply_rope(k.data(), config->hidden_size, config->token_offset, config->rope_theta);
+        apply_rope(k.data(), kv_width, config->token_offset, config->rope_theta);
     }
     status = lm_kv_cache_write_payload(kv_cache, page_id, config->token_offset, 1u, k.data(), v.data());
     if (status != LM_OK) return status;
     status = lm_kv_cache_read_payload(kv_cache, page_id, 0u, config->token_offset + 1u,
                                       keys.data(), values.data());
     if (status != LM_OK) return status;
-    const float attention_scale = 1.0f / std::sqrt(static_cast<float>(config->hidden_size));
-    for (uint32_t t = 0u; t <= config->token_offset; ++t) {
-        const float *key = keys.data() + static_cast<size_t>(t) * config->hidden_size;
-        float dot = 0.0f;
-        for (uint32_t i = 0u; i < config->hidden_size; ++i) dot += q[i] * key[i];
-        scores[t] = dot * attention_scale;
-    }
-    status = lm_cpu_softmax_f32(scores.data(), weights.data(), config->token_offset + 1u);
-    if (status != LM_OK) return status;
-    for (uint32_t t = 0u; t <= config->token_offset; ++t) {
-        const float *value = values.data() + static_cast<size_t>(t) * config->hidden_size;
-        for (uint32_t i = 0u; i < config->hidden_size; ++i) attended[i] += weights[t] * value[i];
+    const float attention_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    const uint32_t query_groups = config->head_count / config->head_count_kv;
+    for (uint32_t head = 0u; head < config->head_count; ++head) {
+        const uint32_t kv_head = head / query_groups;
+        const float *query = q.data() + static_cast<size_t>(head) * head_dim;
+        for (uint32_t t = 0u; t <= config->token_offset; ++t) {
+            const float *key = keys.data() + static_cast<size_t>(t) * kv_width + static_cast<size_t>(kv_head) * head_dim;
+            float dot = 0.0f;
+            for (uint32_t i = 0u; i < head_dim; ++i) dot += query[i] * key[i];
+            scores[t] = dot * attention_scale;
+        }
+        status = lm_cpu_softmax_f32(scores.data(), weights.data(), config->token_offset + 1u);
+        if (status != LM_OK) return status;
+        float *head_output = attended.data() + static_cast<size_t>(head) * head_dim;
+        for (uint32_t t = 0u; t <= config->token_offset; ++t) {
+            const float *value = values.data() + static_cast<size_t>(t) * kv_width + static_cast<size_t>(kv_head) * head_dim;
+            for (uint32_t i = 0u; i < head_dim; ++i) head_output[i] += weights[t] * value[i];
+        }
     }
     status = profile_matvec(model, layer.attn_output, &config->matvec,
                             packed_scratch, packed_scratch_bytes, config->hidden_size,
@@ -466,12 +508,15 @@ lm_status lm_model_execute_native_step(const lm_model_file *model,
         logits_count < config->vocab_size || config->vocab_size > kNativeProfileMaxVocab ||
         config->hidden_size > kNativeProfileMaxHidden || config->intermediate_size > kNativeProfileMaxIntermediate ||
         !(config->rms_epsilon > 0.0f) || !std::isfinite(config->rms_epsilon) ||
-        (config->matrix_format != LM_QUANT_GGML_Q8_0 && config->matrix_format != LM_QUANT_GGML_Q4_K))
+        (config->matrix_format != LM_QUANT_NONE && config->matrix_format != LM_QUANT_GGML_Q8_0 &&
+         config->matrix_format != LM_QUANT_GGML_Q4_K))
         return LM_ERR_ARGUMENT;
     lm_native_attention_config attention{};
     attention.matvec = config->matvec;
     attention.layer_index = config->layer_index;
     attention.hidden_size = config->hidden_size;
+    attention.head_count = config->head_count;
+    attention.head_count_kv = config->head_count_kv;
     attention.token_offset = config->token_offset;
     attention.use_rope = config->use_rope;
     attention.rope_theta = config->rope_theta;
@@ -586,6 +631,8 @@ lm_status lm_model_execute_native_transformer(const lm_model_file *model,
         attention.matvec = config->step.matvec;
         attention.layer_index = layer_index;
         attention.hidden_size = config->step.hidden_size;
+        attention.head_count = config->step.head_count;
+        attention.head_count_kv = config->step.head_count_kv;
         attention.token_offset = config->step.token_offset;
         attention.use_rope = config->step.use_rope;
         attention.rope_theta = config->step.rope_theta;
@@ -642,6 +689,10 @@ lm_status lm_model_generate_native(const lm_model_file *model,
         token_capacity < config->max_new_tokens ||
         config->step.vocab_size == 0u || config->step.hidden_size == 0u ||
         config->step.hidden_size > kNativeProfileMaxHidden ||
+        config->step.head_count == 0u || config->step.head_count_kv == 0u ||
+        config->step.head_count_kv > config->step.head_count ||
+        config->step.head_count % config->step.head_count_kv != 0u ||
+        config->step.hidden_size % config->step.head_count != 0u ||
         config->step.vocab_size > kNativeProfileMaxVocab ||
         config->step.intermediate_size == 0u ||
         config->step.intermediate_size > kNativeProfileMaxIntermediate ||
@@ -650,7 +701,10 @@ lm_status lm_model_generate_native(const lm_model_file *model,
     for (size_t i = 0u; i < prompt_count; ++i)
         if (prompt_tokens[i] >= config->step.vocab_size) return LM_ERR_RANGE;
     const uint32_t context_tokens = static_cast<uint32_t>(prompt_count) + config->max_new_tokens;
-    const uint32_t kv_bytes = config->step.hidden_size * static_cast<uint32_t>(sizeof(float));
+    const uint64_t kv_elements = (static_cast<uint64_t>(config->step.hidden_size) /
+                                  config->step.head_count) * config->step.head_count_kv;
+    if (kv_elements == 0u || kv_elements > UINT32_MAX / sizeof(float)) return LM_ERR_CAPACITY;
+    const uint32_t kv_bytes = static_cast<uint32_t>(kv_elements * sizeof(float));
     std::vector<lm_kv_cache *> layer_caches;
     std::vector<uint8_t> page_live;
     std::vector<float> logits;
