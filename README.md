@@ -36,7 +36,7 @@ Use `--help` for the supported switches. `--backend vulkan` performs capability/
 For the validated narrow profile, use:
 
 ```sh
-./build/tiny-lm --backend cpu --model narrow.gguf \\
+./build/tiny-lm --backend cpu --model narrow.gguf \
   --generate --prompt "ab" --max-new-tokens 8
 ```
 

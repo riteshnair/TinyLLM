@@ -134,6 +134,7 @@ namespace {
 constexpr uint32_t kNativeProfileMaxVocab = 65536u;
 constexpr uint32_t kNativeProfileMaxHidden = 4096u;
 constexpr uint32_t kNativeProfileMaxIntermediate = 16384u;
+constexpr uint32_t kMaxNativeGeneratedTokens = 4096u;
 
 lm_status profile_matrix(const lm_model_file *model, uint64_t index,
                         uint32_t rows, uint32_t columns, lm_quant_format format,
@@ -494,7 +495,7 @@ lm_status lm_model_generate_native(const lm_model_file *model,
                                    size_t *out_count) {
     if (!model || !graph || !config || !prompt_tokens || !packed_scratch || !out_tokens || !out_count ||
         prompt_count == 0u || config->max_new_tokens == 0u ||
-        prompt_count > static_cast<size_t>(1u << 20u) || config->max_new_tokens > (1u << 20u) ||
+        prompt_count > static_cast<size_t>(1u << 20u) || config->max_new_tokens > kMaxNativeGeneratedTokens ||
         prompt_count > static_cast<size_t>((1u << 20u) - config->max_new_tokens) ||
         token_capacity < config->max_new_tokens ||
         config->step.vocab_size == 0u || config->step.hidden_size == 0u ||
@@ -566,7 +567,8 @@ lm_status lm_model_generate_native_text(const lm_model_file *model,
     if (!model || !graph || !config || (!prompt && prompt_bytes != 0u) || !packed_scratch ||
         !out_text || !out_bytes || out_capacity == 0u) return LM_ERR_ARGUMENT;
     const size_t token_capacity = static_cast<size_t>(config->max_new_tokens);
-    if (token_capacity == 0u) return LM_ERR_ARGUMENT;
+    if (token_capacity == 0u || prompt_bytes == std::numeric_limits<size_t>::max() ||
+        config->max_new_tokens > kMaxNativeGeneratedTokens) return LM_ERR_ARGUMENT;
     std::vector<uint32_t> prompt_tokens;
     std::vector<uint32_t> generated;
     size_t prompt_count = 0u;
