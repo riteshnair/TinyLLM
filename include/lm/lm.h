@@ -329,6 +329,7 @@ typedef struct lm_model_architecture {
     uint32_t head_count_kv;
     uint32_t intermediate_length;
     float rope_frequency_base;
+    float rms_epsilon;
 } lm_model_architecture;
 
 typedef struct lm_model_tensor_info {
@@ -365,6 +366,9 @@ lm_status lm_model_open_sharded(const char *const *paths, size_t path_count,
 void lm_model_close(lm_model_file *model);
 /* Replaces the model’s optional tokenizer with an owned tokenizer.json BPE handle. */
 lm_status lm_model_set_tokenizer_json(lm_model_file *model, const char *path,
+                                      char *error_text, size_t error_capacity);
+/* Attaches an explicit standard-HF Llama config.json to a SafeTensors model. */
+lm_status lm_model_set_hf_config_json(lm_model_file *model, const char *path,
                                       char *error_text, size_t error_capacity);
 lm_status lm_model_get_info(const lm_model_file *model, lm_model_info *out_info);
 lm_status lm_model_get_architecture(const lm_model_file *model, lm_model_architecture *out_architecture);
@@ -625,6 +629,8 @@ typedef struct lm_decoder_graph_binding {
     uint64_t token_embedding;
     uint64_t output;
     uint64_t output_norm;
+    /* Nonzero means output aliases token_embedding because the source omits output.weight. */
+    uint8_t output_tied;
     uint32_t layer_count;
     lm_decoder_layer_binding layers[LM_DECODER_PLAN_MAX_LAYERS];
 } lm_decoder_graph_binding;

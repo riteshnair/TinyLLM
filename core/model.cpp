@@ -319,6 +319,7 @@ lm_status inspect_gguf(const char *path, lm_model_info *out_info, char *error_te
     GgufSplitInfo split;
     std::vector<std::string> tokens;
     lm_model_architecture architecture{};
+    architecture.rms_epsilon = 1.0e-5f;
     bool is_llama = false;
     bool has_context_length = false;
     bool has_embedding_length = false;
@@ -397,6 +398,8 @@ lm_status inspect_gguf(const char *path, lm_model_info *out_info, char *error_te
         } else if (key == "llama.rope.freq_base") {
             if (has_rope_frequency_base || !read_arch_float(reader, type, &architecture.rope_frequency_base)) return LM_ERR_PARSE;
             has_rope_frequency_base = true;
+        } else if (key == "llama.attention.layer_norm_rms_epsilon") {
+            if (!read_arch_float(reader, type, &architecture.rms_epsilon)) return LM_ERR_PARSE;
         } else if (!skip_gguf_value(reader, type, 0u)) {
             set_error(error_text, error_capacity, "invalid GGUF metadata value"); return LM_ERR_PARSE;
         }
@@ -617,6 +620,7 @@ bool read_safetensors_metadata(JsonCursor &json, lm_model_architecture *architec
                                std::vector<std::string> *tokens) {
     if (!architecture || !has_architecture || !json.character('{')) return false;
     *has_architecture = false;
+    architecture->rms_epsilon = 1.0e-5f;
     bool is_llama = false;
     bool flags[7] = {};
     std::vector<uint8_t> token_seen;
@@ -1043,6 +1047,88 @@ lm_status lm_model_set_tokenizer_json(lm_model_file *model, const char *path,
     return LM_OK;
 }
 
+lm_status lm_model_set_hf_config_json(lm_model_file *model, const char *path,
+                                       char *error_text, size_t error_capacity) {
+    if (!model || !path) return LM_ERR_ARGUMENT;
+    if (model->info.format != LM_MODEL_SAFETENSORS) {
+        set_error(error_text, error_capacity, "HF config attachment requires SafeTensors");
+        return LM_ERR_UNSUPPORTED;
+    }
+    std::ifstream file(path, std::ios::binary);
+    if (!file) { set_error(error_text, error_capacity, "cannot open config.json"); return LM_ERR_IO; }
+    file.seekg(0, std::ios::end);
+    const std::streamoff end = file.tellg();
+    if (end <= 0 || static_cast<uint64_t>(end) > (1ull << 20u)) {
+        set_error(error_text, error_capacity, "config.json is too large"); return LM_ERR_CAPACITY;
+    }
+    file.seekg(0, std::ios::beg);
+    std::string source(static_cast<size_t>(end), '\0');
+    if (!file.read(source.data(), static_cast<std::streamsize>(source.size()))) {
+        set_error(error_text, error_capacity, "cannot read config.json"); return LM_ERR_IO;
+    }
+    JsonCursor json(source.data(), source.data() + source.size());
+    if (!json.character('{')) { set_error(error_text, error_capacity, "config.json is not an object"); return LM_ERR_PARSE; }
+    bool have_model_type = false, have_hidden = false, have_intermediate = false;
+    bool have_layers = false, have_heads = false, have_rms = false, have_vocab = false;
+    bool have_kv = false, have_context = false, have_rope = false;
+    bool tie_word_embeddings = false;
+    uint32_t hidden = 0u, intermediate = 0u, layers = 0u, heads = 0u, kv_heads = 0u, context = 2048u, vocab = 0u;
+    float rms = 0.0f, rope = 10000.0f;
+    json.whitespace();
+    if (json.position() < json.end() && *json.position() != '}') {
+        for (;;) {
+            std::string key;
+            if (!json.string(&key, 128u) || !json.character(':')) { set_error(error_text, error_capacity, "invalid config.json field"); return LM_ERR_PARSE; }
+            auto read_u32 = [&json](uint32_t *out) {
+                uint64_t value = 0u;
+                return json.unsigned_number(&value) && value != 0u && value <= UINT32_MAX && ((*out = static_cast<uint32_t>(value)), true);
+            };
+            auto read_float = [&json](float *out) {
+                std::string value;
+                return json.token(&value, 64u) && parse_safe_float(value, out);
+            };
+            bool handled = true;
+            if (key == "model_type") {
+                std::string value; if (have_model_type || !json.string(&value, 32u) || value != "llama") { set_error(error_text, error_capacity, "config model_type must be llama"); return LM_ERR_UNSUPPORTED; } have_model_type = true;
+            } else if (key == "hidden_size") { if (have_hidden || !read_u32(&hidden)) return LM_ERR_PARSE; have_hidden = true;
+            } else if (key == "intermediate_size") { if (have_intermediate || !read_u32(&intermediate)) return LM_ERR_PARSE; have_intermediate = true;
+            } else if (key == "num_hidden_layers") { if (have_layers || !read_u32(&layers)) return LM_ERR_PARSE; have_layers = true;
+            } else if (key == "num_attention_heads") { if (have_heads || !read_u32(&heads)) return LM_ERR_PARSE; have_heads = true;
+            } else if (key == "num_key_value_heads") { if (have_kv || !read_u32(&kv_heads)) return LM_ERR_PARSE; have_kv = true;
+            } else if (key == "max_position_embeddings") { if (have_context || !read_u32(&context)) return LM_ERR_PARSE; have_context = true;
+            } else if (key == "vocab_size") { if (have_vocab || !read_u32(&vocab)) return LM_ERR_PARSE; have_vocab = true;
+            } else if (key == "rms_norm_eps") { if (have_rms || !read_float(&rms) || !(rms > 0.0f)) return LM_ERR_PARSE; have_rms = true;
+            } else if (key == "rope_theta") { if (have_rope || !read_float(&rope) || !(rope > 0.0f)) return LM_ERR_PARSE; have_rope = true;
+            } else if (key == "tie_word_embeddings") {
+                std::string value; if (!json.token(&value, 8u) || (value != "true" && value != "false")) return LM_ERR_PARSE;
+                tie_word_embeddings = value == "true";
+            } else handled = false;
+            if (!handled && !json.skip_value(0u)) { set_error(error_text, error_capacity, "invalid config.json value"); return LM_ERR_PARSE; }
+            json.whitespace();
+            if (json.position() < json.end() && *json.position() == '}') { if (!json.consume('}')) return LM_ERR_PARSE; break; }
+            if (!json.character(',')) { set_error(error_text, error_capacity, "invalid config.json separator"); return LM_ERR_PARSE; }
+        }
+    } else if (!json.consume('}')) return LM_ERR_PARSE;
+    json.whitespace();
+    if (json.position() != json.end()) { set_error(error_text, error_capacity, "trailing config.json data"); return LM_ERR_PARSE; }
+    if (!have_kv) kv_heads = heads;
+    if (!have_model_type || !have_hidden || !have_intermediate || !have_layers || !have_heads || !have_rms || !have_vocab ||
+        heads == 0u || (kv_heads == 0u && have_kv) || kv_heads > heads || hidden % heads != 0u || vocab == 0u) {
+        if (have_kv && (kv_heads == 0u || kv_heads > heads)) { set_error(error_text, error_capacity, "invalid Llama attention head configuration"); return LM_ERR_PARSE; }
+        set_error(error_text, error_capacity, "config.json lacks required Llama fields"); return LM_ERR_UNSUPPORTED;
+    }
+    if (tie_word_embeddings) { set_error(error_text, error_capacity, "tied standard-HF SafeTensors output is unsupported"); return LM_ERR_UNSUPPORTED; }
+    if (model->tokenizer) {
+        lm_tokenizer_info tokenizer_info{};
+        if (lm_tokenizer_get_info(model->tokenizer, &tokenizer_info) != LM_OK || tokenizer_info.vocabulary_size != vocab) {
+            set_error(error_text, error_capacity, "config and tokenizer vocabulary sizes differ"); return LM_ERR_PARSE;
+        }
+    }
+    model->architecture = {context, hidden, layers, heads, kv_heads, intermediate, rope, rms};
+    model->has_architecture = 1u;
+    return LM_OK;
+}
+
 lm_status lm_model_token_count(const lm_model_file *model, uint32_t *out_count) {
     if (!model || !out_count) return LM_ERR_ARGUMENT;
     if (model->tokenizer) {
@@ -1229,6 +1315,13 @@ lm_status lm_model_tensor_binding_read(const lm_model_tensor_binding *binding, v
     return lm_model_tensor_binding_view(binding, data, bytes, out_tensor);
 }
 
+static bool matrix_dims_match(const lm_model_tensor_info &descriptor,
+                               uint32_t rows, uint32_t columns) {
+    if (descriptor.rank != 2u) return false;
+    return (descriptor.dims[0] == rows && descriptor.dims[1] == columns) ||
+           (descriptor.dims[0] == columns && descriptor.dims[1] == rows);
+}
+
 lm_status lm_model_tensor_matvec_f32_cpu(const lm_model_file *model, uint64_t tensor_index,
                                          void *matrix_scratch, uint64_t scratch_bytes,
                                          uint32_t rows, uint32_t columns,
@@ -1243,8 +1336,7 @@ lm_status lm_model_tensor_matvec_f32_cpu(const lm_model_file *model, uint64_t te
     lm_model_tensor_info descriptor{};
     lm_status status = lm_model_tensor_info_at(model, tensor_index, &descriptor);
     if (status != LM_OK) return status;
-    if (descriptor.rank != 2u || descriptor.dims[0] != rows || descriptor.dims[1] != columns)
-        return LM_ERR_UNSUPPORTED;
+    if (!matrix_dims_match(descriptor, rows, columns)) return LM_ERR_UNSUPPORTED;
     const bool scalar16 = descriptor.type == LM_DTYPE_F16 || descriptor.type == LM_DTYPE_BF16;
     if (descriptor.type != LM_DTYPE_F32 || scalar16) {
         if (model->info.format != LM_MODEL_SAFETENSORS || !scalar16) return LM_ERR_UNSUPPORTED;
@@ -1435,8 +1527,7 @@ static lm_status validate_q4_k_binding_matvec(const lm_model_tensor_binding *bin
                                                 uint32_t rows, uint32_t columns,
                                                 uint64_t *payload_bytes, uint32_t *blocks_per_row) {
     if (!binding || !payload_bytes || !blocks_per_row || rows == 0u || columns == 0u || columns % 256u != 0u ||
-        binding->quant_format != LM_QUANT_GGML_Q4_K || binding->descriptor.rank != 2u ||
-        binding->descriptor.dims[0] != rows || binding->descriptor.dims[1] != columns)
+        binding->quant_format != LM_QUANT_GGML_Q4_K || !matrix_dims_match(binding->descriptor, rows, columns))
         return LM_ERR_ARGUMENT;
     const uint64_t blocks = static_cast<uint64_t>(columns) / 256u;
     const uint64_t row_bytes = blocks * 144u;
@@ -1457,9 +1548,14 @@ lm_status lm_model_tensor_binding_matvec_q4_k_cpu(const lm_model_tensor_binding 
     const lm_status valid = validate_q4_k_binding_matvec(binding, rows, columns, &payload_bytes, &blocks_per_row);
     if (valid != LM_OK) return valid;
     if (scratch_bytes < payload_bytes) return LM_ERR_CAPACITY;
-    lm_tensor tensor{};
-    const lm_status read = lm_model_tensor_binding_read(binding, packed_scratch, payload_bytes, &tensor);
+    const lm_status read = lm_file_span_read(&binding->span, 0u, packed_scratch,
+                                             static_cast<size_t>(payload_bytes));
     if (read != LM_OK) return read;
+    const uint32_t logical_dims[2] = {rows, columns};
+    lm_tensor tensor{};
+    const lm_status view = lm_tensor_make_q4_k_view(packed_scratch, payload_bytes, 2u,
+                                                    logical_dims, &tensor);
+    if (view != LM_OK) return view;
     return lm_cpu_matvec_q4_k(&tensor, input, rows, columns, out);
 }
 
@@ -1484,8 +1580,7 @@ static lm_status validate_q8_0_binding_matvec(const lm_model_tensor_binding *bin
                                                 uint32_t rows, uint32_t columns,
                                                 uint64_t *payload_bytes, uint32_t *blocks_per_row) {
     if (!binding || !payload_bytes || !blocks_per_row || rows == 0u || columns == 0u || columns % 32u != 0u ||
-        binding->quant_format != LM_QUANT_GGML_Q8_0 || binding->descriptor.rank != 2u ||
-        binding->descriptor.dims[0] != rows || binding->descriptor.dims[1] != columns)
+        binding->quant_format != LM_QUANT_GGML_Q8_0 || !matrix_dims_match(binding->descriptor, rows, columns))
         return LM_ERR_ARGUMENT;
     const uint64_t blocks = static_cast<uint64_t>(columns) / 32u;
     const uint64_t row_bytes = blocks * 34u;
@@ -1507,9 +1602,14 @@ lm_status lm_model_tensor_binding_matvec_q8_0_cpu(const lm_model_tensor_binding 
                                                           &payload_bytes, &blocks_per_row);
     if (valid != LM_OK) return valid;
     if (scratch_bytes < payload_bytes) return LM_ERR_CAPACITY;
-    lm_tensor tensor{};
-    const lm_status read = lm_model_tensor_binding_read(binding, packed_scratch, payload_bytes, &tensor);
+    const lm_status read = lm_file_span_read(&binding->span, 0u, packed_scratch,
+                                             static_cast<size_t>(payload_bytes));
     if (read != LM_OK) return read;
+    const uint32_t logical_dims[2] = {rows, columns};
+    lm_tensor tensor{};
+    const lm_status view = lm_tensor_make_q8_0_view(packed_scratch, payload_bytes, 2u,
+                                                    logical_dims, &tensor);
+    if (view != LM_OK) return view;
     return lm_cpu_matvec_q8_0(&tensor, input, rows, columns, out);
 }
 
@@ -1599,8 +1699,8 @@ lm_status lm_model_tensor_matvec_native(const lm_model_file *model, uint64_t ten
                                                            rows, columns, input, out);
         const uint64_t blocks = static_cast<uint64_t>(columns) / 256u;
         const uint64_t expected = static_cast<uint64_t>(rows) * blocks * 144u;
-        if (binding.descriptor.rank != 2u || binding.descriptor.dims[0] != rows || binding.descriptor.dims[1] != columns ||
-            columns == 0u || columns % 256u != 0u || blocks > UINT32_MAX || expected != binding.span.bytes) return LM_ERR_RANGE;
+        if (!matrix_dims_match(binding.descriptor, rows, columns) || columns == 0u ||
+            columns % 256u != 0u || blocks > UINT32_MAX || expected != binding.span.bytes) return LM_ERR_RANGE;
         if (config->vulkan_context) {
             if (expected > scratch_bytes) return LM_ERR_CAPACITY;
             const lm_status read = lm_file_span_read(&binding.span, 0u, packed_scratch, static_cast<size_t>(expected));
@@ -1619,8 +1719,8 @@ lm_status lm_model_tensor_matvec_native(const lm_model_file *model, uint64_t ten
                                                            rows, columns, input, out);
         const uint64_t blocks = static_cast<uint64_t>(columns) / 32u;
         const uint64_t expected = static_cast<uint64_t>(rows) * blocks * 34u;
-        if (binding.descriptor.rank != 2u || binding.descriptor.dims[0] != rows || binding.descriptor.dims[1] != columns ||
-            columns == 0u || columns % 32u != 0u || blocks > UINT32_MAX || expected != binding.span.bytes) return LM_ERR_RANGE;
+        if (!matrix_dims_match(binding.descriptor, rows, columns) || columns == 0u ||
+            columns % 32u != 0u || blocks > UINT32_MAX || expected != binding.span.bytes) return LM_ERR_RANGE;
         if (config->vulkan_context) {
             if (expected > scratch_bytes) return LM_ERR_CAPACITY;
             const lm_status read = lm_file_span_read(&binding.span, 0u, packed_scratch, static_cast<size_t>(expected));
@@ -1636,6 +1736,18 @@ lm_status lm_model_tensor_matvec_native(const lm_model_file *model, uint64_t ten
     return LM_ERR_UNSUPPORTED;
 }
 
+static bool is_hf_rotary_auxiliary(const lm_model_file *model, const lm_model_tensor_info &tensor) {
+    if (!model || model->info.format != LM_MODEL_SAFETENSORS || !model->has_architecture || tensor.rank != 1u || tensor.type != LM_DTYPE_F32)
+        return false;
+    unsigned layer = 0u;
+    char suffix[64] = {};
+    if (std::sscanf(tensor.name, "model.layers.%u.%63s", &layer, suffix) != 2 ||
+        std::strcmp(suffix, "self_attn.rotary_emb.inv_freq") != 0 || layer >= model->architecture.block_count ||
+        model->architecture.head_count == 0u || model->architecture.embedding_length % model->architecture.head_count != 0u)
+        return false;
+    return tensor.dims[0] == model->architecture.embedding_length / model->architecture.head_count / 2u;
+}
+
 lm_status lm_model_build_llama_graph(const lm_model_file *model,
                                      lm_decoder_graph_binding *out_binding) {
     if (!model || !out_binding || model->tensors.empty()) return LM_ERR_ARGUMENT;
@@ -1646,7 +1758,10 @@ lm_status lm_model_build_llama_graph(const lm_model_file *model,
     for (size_t i = 0u; i < model->tensors.size(); ++i) {
         lm_decoder_tensor_mapping mapping{};
         const lm_status mapped = lm_decoder_map_llama_tensor(&model->tensors[i], &mapping);
-        if (mapped != LM_OK) return mapped;
+        if (mapped != LM_OK) {
+            if (is_hf_rotary_auxiliary(model, model->tensors[i])) continue;
+            return mapped;
+        }
         const uint64_t index = static_cast<uint64_t>(i);
         if (mapping.role <= LM_DECODER_TENSOR_OUTPUT_NORM) {
             const uint32_t bit = 1u << mapping.role;
@@ -1676,6 +1791,13 @@ lm_status lm_model_build_llama_graph(const lm_model_file *model,
     }
     const uint32_t global_required = 7u;
     const uint32_t layer_required = 0xff8u;
+    if ((global_mask & (1u << LM_DECODER_TENSOR_OUTPUT)) == 0u &&
+        (global_mask & (1u << LM_DECODER_TENSOR_TOKEN_EMBEDDING)) != 0u &&
+        model->info.format == LM_MODEL_GGUF) {
+        out_binding->output = out_binding->token_embedding;
+        out_binding->output_tied = 1u;
+        global_mask |= 1u << LM_DECODER_TENSOR_OUTPUT;
+    }
     if (global_mask != global_required || out_binding->layer_count == 0u) return LM_ERR_UNSUPPORTED;
     for (uint32_t layer = 0u; layer < out_binding->layer_count; ++layer)
         if (layer_masks[layer] != layer_required) return LM_ERR_UNSUPPORTED;

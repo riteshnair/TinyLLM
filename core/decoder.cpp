@@ -15,6 +15,18 @@ static bool model_is_safetensors(const lm_model_file *model) {
     return model && lm_model_get_info(model, &info) == LM_OK && info.format == LM_MODEL_SAFETENSORS;
 }
 
+static bool model_is_gguf(const lm_model_file *model) {
+    lm_model_info info{};
+    return model && lm_model_get_info(model, &info) == LM_OK && info.format == LM_MODEL_GGUF;
+}
+
+static bool matrix_dims_match(const lm_model_tensor_info &descriptor,
+                              uint32_t rows, uint32_t columns) {
+    if (descriptor.rank != 2u) return false;
+    return (descriptor.dims[0] == rows && descriptor.dims[1] == columns) ||
+           (descriptor.dims[0] == columns && descriptor.dims[1] == rows);
+}
+
 struct lm_cpu_decoder {
     lm_cpu_decoder_config config;
     uint32_t position;
@@ -77,28 +89,44 @@ lm_status lm_decoder_map_llama_tensor(const lm_model_tensor_info *descriptor,
     out_mapping->rank = descriptor->rank;
     out_mapping->type = descriptor->type;
     for (uint32_t i = 0u; i < descriptor->rank; ++i) out_mapping->dims[i] = descriptor->dims[i];
-    if (std::strcmp(descriptor->name, "token_embd.weight") == 0)
+    if (std::strcmp(descriptor->name, "token_embd.weight") == 0 ||
+        std::strcmp(descriptor->name, "model.embed_tokens.weight") == 0)
         out_mapping->role = LM_DECODER_TENSOR_TOKEN_EMBEDDING;
-    else if (std::strcmp(descriptor->name, "output.weight") == 0)
+    else if (std::strcmp(descriptor->name, "output.weight") == 0 ||
+             std::strcmp(descriptor->name, "lm_head.weight") == 0)
         out_mapping->role = LM_DECODER_TENSOR_OUTPUT;
-    else if (std::strcmp(descriptor->name, "output_norm.weight") == 0)
+    else if (std::strcmp(descriptor->name, "output_norm.weight") == 0 ||
+             std::strcmp(descriptor->name, "model.norm.weight") == 0)
         out_mapping->role = LM_DECODER_TENSOR_OUTPUT_NORM;
     else {
         unsigned layer = 0u;
         char suffix[64] = {};
-        if (std::sscanf(descriptor->name, "blk.%u.%63s", &layer, suffix) != 2 || layer > UINT32_MAX)
-            return LM_ERR_UNSUPPORTED;
-        out_mapping->layer_index = static_cast<uint32_t>(layer);
-        if (std::strcmp(suffix, "attn_norm.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_ATTN_NORM;
-        else if (std::strcmp(suffix, "attn_q.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_ATTN_Q;
-        else if (std::strcmp(suffix, "attn_k.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_ATTN_K;
-        else if (std::strcmp(suffix, "attn_v.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_ATTN_V;
-        else if (std::strcmp(suffix, "attn_output.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_ATTN_OUTPUT;
-        else if (std::strcmp(suffix, "ffn_norm.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_FFN_NORM;
-        else if (std::strcmp(suffix, "ffn_gate.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_FFN_GATE;
-        else if (std::strcmp(suffix, "ffn_down.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_FFN_DOWN;
-        else if (std::strcmp(suffix, "ffn_up.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_FFN_UP;
-        else return LM_ERR_UNSUPPORTED;
+        if (std::sscanf(descriptor->name, "blk.%u.%63s", &layer, suffix) == 2) {
+            out_mapping->layer_index = static_cast<uint32_t>(layer);
+            if (std::strcmp(suffix, "attn_norm.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_ATTN_NORM;
+            else if (std::strcmp(suffix, "attn_q.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_ATTN_Q;
+            else if (std::strcmp(suffix, "attn_k.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_ATTN_K;
+            else if (std::strcmp(suffix, "attn_v.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_ATTN_V;
+            else if (std::strcmp(suffix, "attn_output.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_ATTN_OUTPUT;
+            else if (std::strcmp(suffix, "ffn_norm.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_FFN_NORM;
+            else if (std::strcmp(suffix, "ffn_gate.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_FFN_GATE;
+            else if (std::strcmp(suffix, "ffn_down.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_FFN_DOWN;
+            else if (std::strcmp(suffix, "ffn_up.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_FFN_UP;
+            else return LM_ERR_UNSUPPORTED;
+        } else if (std::sscanf(descriptor->name, "model.layers.%u.%63s", &layer, suffix) == 2) {
+            out_mapping->layer_index = static_cast<uint32_t>(layer);
+            if (std::strcmp(suffix, "input_layernorm.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_ATTN_NORM;
+            else if (std::strcmp(suffix, "self_attn.q_proj.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_ATTN_Q;
+            else if (std::strcmp(suffix, "self_attn.k_proj.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_ATTN_K;
+            else if (std::strcmp(suffix, "self_attn.v_proj.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_ATTN_V;
+            else if (std::strcmp(suffix, "self_attn.o_proj.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_ATTN_OUTPUT;
+            else if (std::strcmp(suffix, "post_attention_layernorm.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_FFN_NORM;
+            else if (std::strcmp(suffix, "mlp.gate_proj.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_FFN_GATE;
+            else if (std::strcmp(suffix, "mlp.down_proj.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_FFN_DOWN;
+            else if (std::strcmp(suffix, "mlp.up_proj.weight") == 0) out_mapping->role = LM_DECODER_TENSOR_FFN_UP;
+            else return LM_ERR_UNSUPPORTED;
+        } else return LM_ERR_UNSUPPORTED;
+        if (layer > UINT32_MAX) return LM_ERR_CAPACITY;
     }
     return LM_OK;
 }
@@ -150,8 +178,8 @@ lm_status profile_matrix(const lm_model_file *model, uint64_t index,
     lm_model_tensor_info descriptor{};
     const lm_status described = lm_model_tensor_info_at(model, index, &descriptor);
     if (described != LM_OK) return described;
-    if (descriptor.rank != 2u || descriptor.dims[0] != rows || descriptor.dims[1] != columns)
-        return LM_ERR_UNSUPPORTED;
+    if (!matrix_dims_match(descriptor, rows, columns) ||
+        (!model_is_gguf(model) && descriptor.dims[0] != rows)) return LM_ERR_UNSUPPORTED;
     if (format == LM_QUANT_NONE) {
         const bool scalar16 = descriptor.type == LM_DTYPE_F16 || descriptor.type == LM_DTYPE_BF16;
         if (descriptor.type != LM_DTYPE_F32 &&
@@ -210,6 +238,62 @@ lm_status profile_vector(const lm_model_file *model, uint64_t index, uint32_t el
         }
     }
     return finite_array(out->data(), out->size()) ? LM_OK : LM_ERR_RANGE;
+}
+
+lm_status profile_matvec(const lm_model_file *model, uint64_t index,
+                         const lm_native_matvec_config *config, void *packed_scratch,
+                         uint64_t packed_scratch_bytes, uint32_t rows, uint32_t columns,
+                         const float *input, float *out);
+
+lm_status profile_embedding_matrix(const lm_model_file *model, uint64_t index,
+                                  uint32_t hidden_size, uint32_t vocab_size,
+                                  lm_quant_format format, uint64_t *payload_bytes) {
+    if (!model || !payload_bytes || hidden_size == 0u || vocab_size == 0u) return LM_ERR_ARGUMENT;
+    lm_model_info info{};
+    lm_model_tensor_info descriptor{};
+    const lm_status described = lm_model_get_info(model, &info);
+    if (described != LM_OK || lm_model_tensor_info_at(model, index, &descriptor) != LM_OK) return described != LM_OK ? described : LM_ERR_STATE;
+    if (info.format == LM_MODEL_SAFETENSORS) {
+        if (format != LM_QUANT_NONE || descriptor.rank != 2u || descriptor.dims[0] != vocab_size ||
+            descriptor.dims[1] != hidden_size ||
+            (descriptor.type != LM_DTYPE_F32 && descriptor.type != LM_DTYPE_F16 && descriptor.type != LM_DTYPE_BF16)) return LM_ERR_UNSUPPORTED;
+        const uint64_t elements = static_cast<uint64_t>(hidden_size) * vocab_size;
+        if (elements > UINT64_MAX / sizeof(float)) return LM_ERR_CAPACITY;
+        *payload_bytes = elements * sizeof(float);
+        return LM_OK;
+    }
+    return profile_matrix(model, index, hidden_size, vocab_size, format, payload_bytes);
+}
+
+lm_status profile_embedding_lookup(const lm_model_file *model, uint64_t index,
+                                   const lm_native_matvec_config *config, void *scratch,
+                                   uint64_t scratch_bytes, uint32_t token_id,
+                                   uint32_t hidden_size, uint32_t vocab_size, float *out) {
+    if (!model || !config || !scratch || !out || token_id >= vocab_size) return LM_ERR_ARGUMENT;
+    lm_model_info info{};
+    lm_model_tensor_info descriptor{};
+    lm_status status = lm_model_get_info(model, &info);
+    if (status != LM_OK || (status = lm_model_tensor_info_at(model, index, &descriptor)) != LM_OK) return status;
+    if (info.format != LM_MODEL_SAFETENSORS) return LM_ERR_UNSUPPORTED;
+    if (descriptor.rank != 2u || descriptor.dims[0] != vocab_size || descriptor.dims[1] != hidden_size ||
+        (descriptor.type != LM_DTYPE_F32 && descriptor.type != LM_DTYPE_F16 && descriptor.type != LM_DTYPE_BF16)) return LM_ERR_UNSUPPORTED;
+    const uint64_t source_bytes = descriptor.type == LM_DTYPE_F32 ? sizeof(float) : sizeof(uint16_t);
+    const uint64_t row_bytes = static_cast<uint64_t>(hidden_size) * source_bytes;
+    const uint64_t row_offset = static_cast<uint64_t>(token_id) * row_bytes;
+    if (row_bytes > scratch_bytes || row_offset > UINT64_MAX - row_bytes) return LM_ERR_CAPACITY;
+    lm_file_span span{};
+    status = lm_model_tensor_span_at(model, index, row_offset + row_bytes, &span);
+    if (status != LM_OK) return status;
+    if (descriptor.type == LM_DTYPE_F32) return lm_file_span_read(&span, row_offset, out, static_cast<size_t>(row_bytes));
+    status = lm_file_span_read(&span, row_offset, scratch, static_cast<size_t>(row_bytes));
+    if (status != LM_OK) return status;
+    for (uint32_t i = 0u; i < hidden_size; ++i) {
+        uint16_t bits = 0u;
+        std::memcpy(&bits, static_cast<unsigned char *>(scratch) + static_cast<size_t>(i) * sizeof(bits), sizeof(bits));
+        if (descriptor.type == LM_DTYPE_F16) out[i] = half_to_float(bits);
+        else { uint32_t expanded = static_cast<uint32_t>(bits) << 16u; std::memcpy(&out[i], &expanded, sizeof(float)); }
+    }
+    return finite_array(out, hidden_size) ? LM_OK : LM_ERR_RANGE;
 }
 
 lm_status profile_matvec(const lm_model_file *model, uint64_t index,
@@ -389,9 +473,13 @@ lm_status lm_model_execute_native_mlp_logits(const lm_model_file *model,
     } catch (const std::bad_alloc &) {
         return LM_ERR_CAPACITY;
     }
-    lm_status status = profile_matvec(model, graph->token_embedding, &config->matvec, packed_scratch,
-                                      packed_scratch_bytes, config->hidden_size, config->vocab_size,
-                                      one_hot.data(), embedding.data());
+    lm_status status = model_is_safetensors(model) ?
+        profile_embedding_lookup(model, graph->token_embedding, &config->matvec, packed_scratch,
+                                 packed_scratch_bytes, token_id, config->hidden_size,
+                                 config->vocab_size, embedding.data()) :
+        profile_matvec(model, graph->token_embedding, &config->matvec, packed_scratch,
+                       packed_scratch_bytes, config->hidden_size, config->vocab_size,
+                       one_hot.data(), embedding.data());
     if (status != LM_OK) return status;
     status = profile_vector(model, layer.ffn_norm, config->hidden_size, &ffn_norm);
     if (status != LM_OK) return status;
@@ -599,8 +687,8 @@ lm_status lm_model_execute_native_step(const lm_model_file *model,
     attention.rms_epsilon = config->rms_epsilon;
     attention.matrix_format = config->matrix_format;
     uint64_t embedding_payload = 0u;
-    lm_status status = profile_matrix(model, graph->token_embedding, config->hidden_size,
-                                      config->vocab_size, config->matrix_format, &embedding_payload);
+    lm_status status = profile_embedding_matrix(model, graph->token_embedding, config->hidden_size,
+                                                config->vocab_size, config->matrix_format, &embedding_payload);
     if (status != LM_OK) return status;
     if (packed_scratch_bytes < embedding_payload) return LM_ERR_CAPACITY;
     std::vector<float> one_hot, embedding, attended, normed, output_norm;
@@ -613,9 +701,13 @@ lm_status lm_model_execute_native_step(const lm_model_file *model,
     } catch (const std::bad_alloc &) {
         return LM_ERR_CAPACITY;
     }
-    status = profile_matvec(model, graph->token_embedding, &config->matvec, packed_scratch,
-                            packed_scratch_bytes, config->hidden_size, config->vocab_size,
-                            one_hot.data(), embedding.data());
+    status = model_is_safetensors(model) ?
+        profile_embedding_lookup(model, graph->token_embedding, &config->matvec, packed_scratch,
+                                 packed_scratch_bytes, token_id, config->hidden_size,
+                                 config->vocab_size, embedding.data()) :
+        profile_matvec(model, graph->token_embedding, &config->matvec, packed_scratch,
+                       packed_scratch_bytes, config->hidden_size, config->vocab_size,
+                       one_hot.data(), embedding.data());
     if (status != LM_OK) return status;
     status = lm_model_execute_native_attention(model, graph, &attention, embedding.data(), kv_cache,
                                                page_id, packed_scratch, packed_scratch_bytes,
@@ -682,8 +774,8 @@ lm_status lm_model_execute_native_transformer(const lm_model_file *model,
     for (uint32_t layer = 0u; layer < graph->layer_count; ++layer)
         if (!layer_caches[layer]) return LM_ERR_ARGUMENT;
     uint64_t payload = 0u;
-    lm_status status = profile_matrix(model, graph->token_embedding, config->step.hidden_size,
-                                      config->step.vocab_size, config->step.matrix_format, &payload);
+    lm_status status = profile_embedding_matrix(model, graph->token_embedding, config->step.hidden_size,
+                                                config->step.vocab_size, config->step.matrix_format, &payload);
     if (status != LM_OK) return status;
     status = profile_matrix(model, graph->output, config->step.vocab_size,
                             config->step.hidden_size, config->step.matrix_format, &payload);
@@ -699,9 +791,13 @@ lm_status lm_model_execute_native_transformer(const lm_model_file *model,
     } catch (const std::bad_alloc &) {
         return LM_ERR_CAPACITY;
     }
-    status = profile_matvec(model, graph->token_embedding, &config->step.matvec,
-                            packed_scratch, packed_scratch_bytes, config->step.hidden_size,
-                            config->step.vocab_size, one_hot.data(), hidden.data());
+    status = model_is_safetensors(model) ?
+        profile_embedding_lookup(model, graph->token_embedding, &config->step.matvec,
+                                 packed_scratch, packed_scratch_bytes, token_id,
+                                 config->step.hidden_size, config->step.vocab_size, hidden.data()) :
+        profile_matvec(model, graph->token_embedding, &config->step.matvec,
+                       packed_scratch, packed_scratch_bytes, config->step.hidden_size,
+                       config->step.vocab_size, one_hot.data(), hidden.data());
     if (status != LM_OK) return status;
     for (uint32_t layer_index = 0u; layer_index < graph->layer_count; ++layer_index) {
         lm_native_attention_config attention{};

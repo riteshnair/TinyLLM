@@ -33,3 +33,8 @@ code/build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local real-model validation and root build directories
+/validation_models/
+/build/
+/build-*/

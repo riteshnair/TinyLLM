@@ -271,12 +271,13 @@ static void test_native_model_tensor_binding() {
     std::vector<unsigned char> gguf(24u, 0u);
     gguf[0] = 'G'; gguf[1] = 'G'; gguf[2] = 'U'; gguf[3] = 'F';
     gguf[4] = 3u;
-    gguf[8] = 3u;
+    gguf[8] = 4u;
     put_descriptor(&gguf, "q4", 2u, 0u, 32u);
     put_matrix_descriptor(&gguf, "q8", 8u, 32u, 1u, 32u);
     put_descriptor(&gguf, "q4_k", 12u, 96u, 256u);
+    put_matrix_descriptor(&gguf, "q8_native", 8u, 256u, 32u, 2u);
     const size_t header_size = (gguf.size() + 31u) & ~static_cast<size_t>(31u);
-    gguf.resize(header_size + 96u + 144u, 0u);
+    gguf.resize(header_size + 256u + 68u, 0u);
     gguf[header_size] = 0x00u;
     gguf[header_size + 1u] = 0x3cu;
     for (unsigned i = 0u; i < 16u; ++i) gguf[header_size + 2u + i] = 0x99u;
@@ -288,6 +289,12 @@ static void test_native_model_tensor_binding() {
     for (unsigned i = 0u; i < 4u; ++i) gguf[header_size + 100u + i] = 1u;
     for (unsigned i = 0u; i < 4u; ++i) gguf[header_size + 108u + i] = 1u;
     for (unsigned i = 0u; i < 128u; ++i) gguf[header_size + 112u + i] = 0x11u;
+    gguf[header_size + 256u] = 0x00u;
+    gguf[header_size + 257u] = 0x3cu;
+    for (unsigned i = 0u; i < 32u; ++i) gguf[header_size + 258u + i] = 1u;
+    gguf[header_size + 290u] = 0x00u;
+    gguf[header_size + 291u] = 0x3cu;
+    for (unsigned i = 0u; i < 32u; ++i) gguf[header_size + 292u + i] = 2u;
     const char *path = "test-native-binding.gguf";
     {
         std::ofstream file(path, std::ios::binary);
@@ -412,6 +419,16 @@ static void test_native_model_tensor_binding() {
                                                    sizeof(matrix_scratch), 1u, 256u,
                                                    matrix_input, matrix_cpu) == LM_OK);
     assert(matrix_cpu[0] == 256.0f);
+    lm_model_tensor_binding native_axes_binding{};
+    assert(lm_model_tensor_bind_native(model, 3u, &native_axes_binding) == LM_OK &&
+           native_axes_binding.descriptor.dims[0] == 32u && native_axes_binding.descriptor.dims[1] == 2u &&
+           native_axes_binding.span.bytes == 68u);
+    unsigned char native_axes_scratch[68] = {};
+    float native_axes_output[2] = {};
+    assert(lm_model_tensor_binding_matvec_q8_0_cpu(&native_axes_binding, native_axes_scratch,
+                                                   sizeof(native_axes_scratch), 2u, 32u,
+                                                   matrix_input, native_axes_output) == LM_OK);
+    assert(native_axes_output[0] == 32.0f && native_axes_output[1] == 64.0f);
     uint32_t model_vulkan_devices = 0u;
     if (lm_vulkan_device_count(&model_vulkan_devices) == LM_OK && model_vulkan_devices != 0u) {
         float matrix_vulkan[1] = {};
@@ -793,7 +810,7 @@ static void test_safetensors_native_mlp() {
     transformer.step.rms_epsilon = config.rms_epsilon;
     transformer.step.matrix_format = LM_QUANT_NONE;
     transformer.has_architecture = 1u;
-    transformer.architecture = {4u, 2u, 1u, 1u, 1u, 2u, 10000.0f};
+    transformer.architecture = {4u, 2u, 1u, 1u, 1u, 2u, 10000.0f, 1.0e-5f};
     lm_kv_cache *transformer_cache = nullptr;
     lm_kv_cache *step_cache = nullptr;
     assert(lm_kv_cache_create_with_payload(1u, 4u, 8u, 8u, &transformer_cache) == LM_OK);
@@ -1437,7 +1454,17 @@ static void test_safetensors_parser() {
     assert(output[0] == 5.0f && output[1] == 11.0f);
     assert(lm_model_tensor_matvec_f32_cpu(model, 1u, matrix_scratch, sizeof(float),
                                           2u, 2u, input, output) == LM_ERR_CAPACITY);
+    const char *config_path = "test-hf-config.json";
+    const char *config_json = "{\"model_type\":\"llama\",\"hidden_size\":2,\"intermediate_size\":4,\"num_hidden_layers\":1,\"num_attention_heads\":1,\"rms_norm_eps\":1e-5,\"vocab_size\":2}";
+    { std::ofstream file(config_path, std::ios::binary); file.write(config_json, static_cast<std::streamsize>(std::strlen(config_json))); }
+    assert(lm_model_set_hf_config_json(model, config_path, error, sizeof(error)) == LM_OK);
+    lm_model_architecture config_architecture{};
+    assert(lm_model_get_architecture(model, &config_architecture) == LM_OK && config_architecture.context_length == 2048u &&
+           config_architecture.embedding_length == 2u && config_architecture.block_count == 1u &&
+           config_architecture.head_count == 1u && config_architecture.head_count_kv == 1u &&
+           config_architecture.intermediate_length == 4u && config_architecture.rms_epsilon > 0.0f);
     lm_model_close(model);
+    std::remove(config_path);
     std::remove(valid_path);
 
     const char *bad_path = "bad-fixture.safetensors";
@@ -1489,6 +1516,32 @@ static void test_tokenizer_json_bpe() {
     lm_tokenizer_destroy(tokenizer);
     std::remove(path);
     std::remove(model_path);
+
+    const char *sentencepiece_path = "test-tokenizer-sentencepiece.json";
+    const char *sentencepiece_json = R"({
+      "version":"1.0",
+      "model":{"type":"BPE","vocab":{"<unk>":0,"<s>":1,"<0xC3>":2,"<0xA9>":3,"▁":4,"a":5,"▁a":6},"merges":["▁ a"],"unk_token":"<unk>","continuing_subword_prefix":null,"end_of_word_suffix":null,"byte_fallback":true,"fuse_unk":true,"ignore_merges":false,"dropout":null},
+      "normalizer":{"type":"Sequence","normalizers":[{"type":"Prepend","prepend":"▁"},{"type":"Replace","pattern":{"String":" "},"content":"▁"}]},
+      "pre_tokenizer":null,
+      "post_processor":{"type":"TemplateProcessing","single":[{"SpecialToken":{"id":"<s>","type_id":0}},{"Sequence":{"id":"A","type_id":0}}],"special_tokens":{"<s>":{"id":"<s>","ids":[1],"tokens":["<s>"]}}},
+      "decoder":{"type":"Sequence","decoders":[{"type":"Replace","pattern":{"String":"▁"},"content":" "},{"type":"ByteFallback"},{"type":"Fuse"},{"type":"Strip","content":" ","start":1,"stop":0}]},
+      "added_tokens":[{"id":0,"content":"<unk>","special":true},{"id":1,"content":"<s>","special":true}]
+    })";
+    { std::ofstream file(sentencepiece_path, std::ios::binary); file.write(sentencepiece_json, static_cast<std::streamsize>(std::strlen(sentencepiece_json))); }
+    lm_tokenizer *sentencepiece = nullptr;
+    assert(lm_tokenizer_open_json(sentencepiece_path, &sentencepiece, error, sizeof(error)) == LM_OK);
+    lm_tokenizer_info sentencepiece_info{};
+    assert(lm_tokenizer_get_info(sentencepiece, &sentencepiece_info) == LM_OK && sentencepiece_info.vocabulary_size == 7u && sentencepiece_info.merge_count == 1u);
+    uint32_t sentencepiece_tokens[8] = {};
+    size_t sentencepiece_count = 0u;
+    assert(lm_tokenizer_encode(sentencepiece, "a \xC3\xA9", 4u, sentencepiece_tokens, 8u, &sentencepiece_count) == LM_OK);
+    assert(sentencepiece_count == 5u && sentencepiece_tokens[0] == 1u && sentencepiece_tokens[1] == 6u && sentencepiece_tokens[2] == 4u && sentencepiece_tokens[3] == 2u && sentencepiece_tokens[4] == 3u);
+    char sentencepiece_text[16] = {};
+    size_t sentencepiece_bytes = 0u;
+    assert(lm_tokenizer_decode(sentencepiece, sentencepiece_tokens, sentencepiece_count, sentencepiece_text, sizeof(sentencepiece_text), &sentencepiece_bytes) == LM_OK && sentencepiece_bytes == 4u && std::strcmp(sentencepiece_text, "a \xC3\xA9") == 0);
+    assert(lm_tokenizer_encode(sentencepiece, "", 0u, sentencepiece_tokens, 8u, &sentencepiece_count) == LM_OK && sentencepiece_count == 1u && sentencepiece_tokens[0] == 1u);
+    lm_tokenizer_destroy(sentencepiece);
+    std::remove(sentencepiece_path);
 
     const char *unsupported_path = "test-tokenizer-unsupported.json";
     const char *unsupported_json = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]},\"normalizer\":{\"type\":\"Lowercase\"}}";

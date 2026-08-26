@@ -7,6 +7,7 @@
 #include <string>
 #include <algorithm>
 #include <cctype>
+#include <fstream>
 #if defined(__unix__) || defined(__APPLE__)
 #include <arpa/inet.h>
 #include <cerrno>
@@ -24,6 +25,7 @@ static void print_help() {
     std::puts("  --kv-page-tokens N --trace --deterministic --no-prefetch");
     std::puts("  --dump-config --dry-run --list-devices --help");
     std::puts("  --generate --prompt TEXT --max-new-tokens N");
+    std::puts("  --tokenizer PATH --config PATH (required for standard HF SafeTensors)");
     std::puts("  --server --port N --model PATH");
 }
 
@@ -40,6 +42,34 @@ static bool parse_bounded_u32(const char *text, uint32_t *out) {
     if (!end || *end != '\0' || value > 1024u) return false;
     *out = static_cast<uint32_t>(value);
     return true;
+}
+
+static bool matrix_shape_ok(const lm_model_tensor_info &tensor,
+                            uint32_t rows, uint32_t columns, bool raw_gguf_axes) {
+    if (tensor.rank != 2u) return false;
+    if (tensor.dims[0] == rows && tensor.dims[1] == columns) return true;
+    return raw_gguf_axes && tensor.dims[0] == columns && tensor.dims[1] == rows;
+}
+
+static std::string resolve_shader_path(const char *name) {
+    if (!name) return std::string();
+    std::ifstream direct(name, std::ios::binary);
+    if (direct.good()) return std::string(name);
+#if defined(__unix__) || defined(__APPLE__)
+    char executable[4096] = {};
+    const ssize_t length = readlink("/proc/self/exe", executable, sizeof(executable) - 1u);
+    if (length > 0) {
+        executable[length] = '\0';
+        const std::string path(executable);
+        const size_t slash = path.find_last_of('/');
+        if (slash != std::string::npos) {
+            const std::string candidate = path.substr(0u, slash + 1u) + name;
+            std::ifstream beside_executable(candidate, std::ios::binary);
+            if (beside_executable.good()) return candidate;
+        }
+    }
+#endif
+    return std::string(name);
 }
 
 static lm_status open_cli_model(const char *path, lm_model_file **out_model, char *error, size_t error_capacity) {
@@ -80,8 +110,13 @@ struct http_stream_state {
     const lm_model_file *model;
 };
 
-static lm_status run_native_generation(const lm_config &config, const char *prompt,
-                                       uint32_t max_new_tokens, char *result,
+struct generation_assets {
+    const char *tokenizer_path;
+    const char *config_path;
+};
+
+static lm_status run_native_generation(const lm_config &config, const generation_assets &assets,
+                                       const char *prompt, uint32_t max_new_tokens, char *result,
                                        size_t result_capacity, size_t *result_bytes,
                                        lm_native_token_callback callback = nullptr,
                                        void *callback_user = nullptr) {
@@ -100,6 +135,14 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
     status = lm_model_get_info(model, &model_info);
     if (status != LM_OK) { lm_model_close(model); return status; }
     const bool safetensors = model_info.format == LM_MODEL_SAFETENSORS;
+    if (safetensors) {
+        if (!assets.tokenizer_path || !assets.config_path) {
+            lm_model_close(model); return LM_ERR_UNSUPPORTED;
+        }
+        status = lm_model_set_tokenizer_json(model, assets.tokenizer_path, error, sizeof(error));
+        if (status == LM_OK) status = lm_model_set_hf_config_json(model, assets.config_path, error, sizeof(error));
+        if (status != LM_OK) { lm_model_close(model); return status; }
+    }
     status = lm_model_build_llama_graph(model, &graph);
     if (status != LM_OK || graph.layer_count == 0u || graph.layer_count > LM_DECODER_PLAN_MAX_LAYERS) {
         lm_model_close(model);
@@ -125,9 +168,24 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
     if (status != LM_OK) { lm_model_close(model); return status; }
     status = descriptor(graph.output_norm, &output_norm);
     if (status != LM_OK) { lm_model_close(model); return status; }
-    if (embedding.rank != 2u || output.rank != 2u || embedding.dims[1] != output.dims[0] ||
-        embedding.dims[0] != output.dims[1] || embedding.dims[0] != architecture.embedding_length ||
-        output_norm.rank != 1u || output_norm.dims[0] != embedding.dims[0] ||
+    uint32_t token_count = 0u;
+    if (lm_model_token_count(model, &token_count) != LM_OK || token_count == 0u) {
+        lm_model_close(model); return LM_ERR_UNSUPPORTED;
+    }
+    const bool raw_gguf_axes = !safetensors;
+    const bool standard_embedding_shape = safetensors && embedding.rank == 2u &&
+        embedding.dims[0] == token_count && embedding.dims[1] == architecture.embedding_length;
+    const bool output_shape_ok = graph.output_tied ?
+        (output.rank == 2u && output.dims[0] == embedding.dims[0] && output.dims[1] == embedding.dims[1]) :
+        (safetensors ? (output.rank == 2u && output.dims[0] == token_count && output.dims[1] == architecture.embedding_length) :
+         matrix_shape_ok(output, static_cast<uint32_t>(embedding.dims[1]),
+                         static_cast<uint32_t>(embedding.dims[0]), raw_gguf_axes));
+    if (embedding.rank != 2u || (!safetensors && !matrix_shape_ok(embedding,
+        static_cast<uint32_t>(architecture.embedding_length),
+        static_cast<uint32_t>(embedding.dims[1]), raw_gguf_axes)) ||
+        (!safetensors && embedding.dims[0] != architecture.embedding_length) ||
+        (!standard_embedding_shape && safetensors) || !output_shape_ok ||
+        output_norm.rank != 1u || output_norm.dims[0] != architecture.embedding_length ||
         output.type != embedding.type ||
         (!safetensors && output_norm.type != LM_DTYPE_F32) ||
         (safetensors && output_norm.type != LM_DTYPE_F32 && output_norm.type != LM_DTYPE_F16 && output_norm.type != LM_DTYPE_BF16)) {
@@ -135,6 +193,7 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
         return LM_ERR_UNSUPPORTED;
     }
     const uint32_t matrix_type = embedding.type;
+    const uint32_t hidden_size = safetensors ? architecture.embedding_length : static_cast<uint32_t>(embedding.dims[0]);
     const bool scalar16 = safetensors && (matrix_type == LM_DTYPE_F16 || matrix_type == LM_DTYPE_BF16);
     const bool scalar32 = safetensors && matrix_type == LM_DTYPE_F32;
     const bool packed = !safetensors && (matrix_type == 8u || matrix_type == 12u);
@@ -170,30 +229,27 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
                     lm_model_close(model); return LM_ERR_UNSUPPORTED;
                 }
             }
-            const uint32_t head_dim = static_cast<uint32_t>(embedding.dims[0]) / architecture.head_count;
+            const uint32_t head_dim = hidden_size / architecture.head_count;
             const uint32_t kv_width = head_dim * architecture.head_count_kv;
-            if (layer_infos[0].dims[0] != embedding.dims[0] || layer_infos[0].dims[1] != embedding.dims[0] ||
-                layer_infos[1].dims[0] != kv_width || layer_infos[1].dims[1] != embedding.dims[0] ||
-                layer_infos[2].dims[0] != kv_width || layer_infos[2].dims[1] != embedding.dims[0] ||
-                layer_infos[3].dims[0] != embedding.dims[0] || layer_infos[3].dims[1] != embedding.dims[0] ||
-                layer_infos[4].dims[0] != architecture.intermediate_length ||
-                layer_infos[4].dims[1] != embedding.dims[0] ||
-                layer_infos[5].dims[0] != embedding.dims[0] ||
-                layer_infos[5].dims[1] != architecture.intermediate_length ||
-                layer_infos[6].dims[0] != architecture.intermediate_length ||
-                layer_infos[6].dims[1] != embedding.dims[0]) {
+            if (!matrix_shape_ok(layer_infos[0], hidden_size, hidden_size, raw_gguf_axes) ||
+                !matrix_shape_ok(layer_infos[1], kv_width, hidden_size, raw_gguf_axes) ||
+                !matrix_shape_ok(layer_infos[2], kv_width, hidden_size, raw_gguf_axes) ||
+                !matrix_shape_ok(layer_infos[3], hidden_size, hidden_size, raw_gguf_axes) ||
+                !matrix_shape_ok(layer_infos[4], architecture.intermediate_length, hidden_size, raw_gguf_axes) ||
+                !matrix_shape_ok(layer_infos[5], hidden_size, architecture.intermediate_length, raw_gguf_axes) ||
+                !matrix_shape_ok(layer_infos[6], architecture.intermediate_length, hidden_size, raw_gguf_axes)) {
                 lm_model_close(model); return LM_ERR_UNSUPPORTED;
             }
             lm_model_tensor_info attn_norm{};
             lm_model_tensor_info ffn_norm{};
             status = descriptor(layer.attn_norm, &attn_norm);
-            if (status != LM_OK || attn_norm.rank != 1u || attn_norm.dims[0] != embedding.dims[0] ||
+            if (status != LM_OK || attn_norm.rank != 1u || attn_norm.dims[0] != hidden_size ||
                 ((!safetensors && attn_norm.type != LM_DTYPE_F32) ||
                  (safetensors && attn_norm.type != LM_DTYPE_F32 && attn_norm.type != LM_DTYPE_F16 && attn_norm.type != LM_DTYPE_BF16))) {
                 lm_model_close(model); return status != LM_OK ? status : LM_ERR_UNSUPPORTED;
             }
             status = descriptor(layer.ffn_norm, &ffn_norm);
-            if (status != LM_OK || ffn_norm.rank != 1u || ffn_norm.dims[0] != embedding.dims[0] ||
+            if (status != LM_OK || ffn_norm.rank != 1u || ffn_norm.dims[0] != hidden_size ||
                 ((!safetensors && ffn_norm.type != LM_DTYPE_F32) ||
                  (safetensors && ffn_norm.type != LM_DTYPE_F32 && ffn_norm.type != LM_DTYPE_F16 && ffn_norm.type != LM_DTYPE_BF16))) {
                 lm_model_close(model); return status != LM_OK ? status : LM_ERR_UNSUPPORTED;
@@ -204,9 +260,8 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
         lm_model_close(model);
         return LM_ERR_CAPACITY;
     }
-    uint32_t token_count = 0u;
-    if (lm_model_token_count(model, &token_count) != LM_OK || token_count != output.dims[0] ||
-        token_count != embedding.dims[1] || embedding.dims[0] > 4096u || architecture.intermediate_length > 16384u) {
+    if ((!graph.output_tied && token_count != (output.dims[0] > output.dims[1] ? output.dims[0] : output.dims[1])) ||
+        (!safetensors && token_count != embedding.dims[1]) || token_count > 65536u || hidden_size > 4096u || architecture.intermediate_length > 16384u) {
         lm_model_close(model);
         return LM_ERR_UNSUPPORTED;
     }
@@ -242,20 +297,24 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
         lm_model_close(model);
         return LM_ERR_CAPACITY;
     }
-    const char *shader = safetensors ? "matvec_f32.comp.spv" :
-                         (matrix_type == 8u ? "matvec_q8_0_f32.comp.spv" : "matvec_q4_k_f32.comp.spv");
+    const char *shader_name = safetensors ? "matvec_f32.comp.spv" :
+                              (matrix_type == 8u ? "matvec_q8_0_f32.comp.spv" : "matvec_q4_k_f32.comp.spv");
+    const std::string shader_path = resolve_shader_path(shader_name);
     lm_native_generation_config generation{};
-    generation.step.matvec = {execution_backend, config.device_index, shader, nullptr};
+    generation.step.matvec = {execution_backend, config.device_index, shader_path.c_str(), nullptr};
     generation.step.layer_index = 0u;
     generation.step.vocab_size = token_count;
-    generation.step.hidden_size = static_cast<uint32_t>(embedding.dims[0]);
+    generation.step.hidden_size = hidden_size;
     generation.step.intermediate_size = architecture.intermediate_length;
     generation.step.head_count = architecture.head_count;
     generation.step.head_count_kv = architecture.head_count_kv;
-    generation.step.use_rope = 0u;
-    generation.step.rms_epsilon = 1.0e-5f;
+    generation.step.use_rope = 1u;
+    generation.step.rope_theta = architecture.rope_frequency_base;
+    generation.step.rms_epsilon = architecture.rms_epsilon > 0.0f ? architecture.rms_epsilon : 1.0e-5f;
     generation.step.matrix_format = safetensors ? LM_QUANT_NONE :
                                     (matrix_type == 8u ? LM_QUANT_GGML_Q8_0 : LM_QUANT_GGML_Q4_K);
+    generation.has_architecture = 1u;
+    generation.architecture = architecture;
     generation.kv_dtype = config.kv_dtype;
     generation.use_typed_kv = execution_backend == LM_BACKEND_CPU ? 1u : 0u;
     generation.sampling = {LM_SAMPLING_GREEDY, 0u, 1.0f, 1u};
@@ -469,7 +528,7 @@ static lm_status http_stream_token(void *user, uint32_t token_id, float probabil
     return send_all(state->socket_fd, event.data(), event.size()) ? LM_OK : LM_ERR_IO;
 }
 
-static int run_http_server(const lm_config &config, uint32_t port) {
+static int run_http_server(const lm_config &config, const generation_assets &assets, uint32_t port) {
     const int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) return 4;
     int reuse = 1;
@@ -516,7 +575,7 @@ static int run_http_server(const lm_config &config, uint32_t port) {
                         continue;
                     }
                     http_stream_state stream_state{client, nullptr};
-                    const lm_status status = run_native_generation(config, prompt.c_str(), max_tokens,
+                    const lm_status status = run_native_generation(config, assets, prompt.c_str(), max_tokens,
                                                                    nullptr, 0u, nullptr,
                                                                    http_stream_token, &stream_state);
                     if (status == LM_OK) {
@@ -534,7 +593,7 @@ static int run_http_server(const lm_config &config, uint32_t port) {
                 } else {
                     std::vector<char> generated(static_cast<size_t>(max_tokens) * 256u + 1u, '\0');
                     size_t generated_bytes = 0u;
-                    const lm_status status = run_native_generation(config, prompt.c_str(), max_tokens,
+                    const lm_status status = run_native_generation(config, assets, prompt.c_str(), max_tokens,
                                                                    generated.data(), generated.size(), &generated_bytes);
                     if (status != LM_OK) {
                         const std::string error = std::string("{\"error\":\"") + lm_status_name(status) + "\"}";
@@ -555,7 +614,7 @@ static int run_http_server(const lm_config &config, uint32_t port) {
     return 0;
 }
 #else
-static int run_http_server(const lm_config &, uint32_t) { return 4; }
+static int run_http_server(const lm_config &, const generation_assets &, uint32_t) { return 4; }
 #endif
 
 int main(int argc, char **argv) {
@@ -565,6 +624,8 @@ int main(int argc, char **argv) {
     bool server = false;
     uint32_t server_port = 8080u;
     const char *prompt = nullptr;
+    const char *tokenizer_path = nullptr;
+    const char *config_path = nullptr;
     uint32_t max_new_tokens = 0u;
     std::vector<char *> filtered;
     filtered.push_back(argv[0]);
@@ -575,7 +636,9 @@ int main(int argc, char **argv) {
             const unsigned long value = std::strtoul(argv[++i], nullptr, 10);
             if (value == 0u || value > 65535u) { std::fprintf(stderr, "configuration error: invalid --port\\n"); return 2; }
             server_port = static_cast<uint32_t>(value);
-        } else if (std::strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) prompt = argv[++i];
+        }         else if (std::strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) prompt = argv[++i];
+        else if (std::strcmp(argv[i], "--tokenizer") == 0 && i + 1 < argc) tokenizer_path = argv[++i];
+        else if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) config_path = argv[++i];
         else if (std::strcmp(argv[i], "--max-new-tokens") == 0 && i + 1 < argc) {
             if (!parse_bounded_u32(argv[++i], &max_new_tokens)) {
                 std::fprintf(stderr, "configuration error: invalid --max-new-tokens\\n");
@@ -598,6 +661,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "configuration error: --server requires --model\\n");
         return 2;
     }
+    const generation_assets assets{tokenizer_path, config_path};
     bool list_devices = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0) {
@@ -606,9 +670,10 @@ int main(int argc, char **argv) {
         }
         if (std::strcmp(argv[i], "--list-devices") == 0) list_devices = true;
     }
-    if (server) return run_http_server(config, server_port);
+    if (server) return run_http_server(config, assets, server_port);
     if (generate) {
-        const lm_status status = run_native_generation(config, prompt, max_new_tokens, nullptr, 0u, nullptr);
+        const lm_status status = run_native_generation(config, assets, prompt, max_new_tokens, nullptr, 0u, nullptr);
+        if (status != LM_OK) std::fprintf(stderr, "generation failed: %s\n", lm_status_name(status));
         return status == LM_OK ? 0 : 4;
     }
     if (list_devices) {
