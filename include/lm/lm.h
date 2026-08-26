@@ -464,6 +464,51 @@ lm_status lm_model_moe_route_f32_cpu(const lm_model_file *model, uint64_t router
                                      uint32_t expert_count, uint32_t experts_per_token,
                                      lm_moe_route_policy policy, lm_moe_route *out_route);
 
+typedef struct lm_model_moe_layer_config {
+    uint64_t router_tensor;
+    uint64_t gate_up_tensor;
+    uint64_t down_tensor;
+    uint32_t expected_layer;
+    uint32_t hidden_size;
+    uint32_t intermediate_size;
+    uint32_t expert_count;
+    uint32_t experts_per_token;
+    lm_moe_route_policy route_policy;
+} lm_model_moe_layer_config;
+
+lm_status lm_model_execute_moe_layer_f32_router_q4_k_cpu(const lm_model_file *model,
+                                                         const lm_model_moe_layer_config *config,
+                                                         void *router_scratch, uint64_t router_scratch_bytes,
+                                                         void *gate_up_scratch, uint64_t gate_up_scratch_bytes,
+                                                         void *down_scratch, uint64_t down_scratch_bytes,
+                                                         const float *input, float *out_hidden,
+                                                         size_t out_hidden_count);
+
+#define LM_MOE_GRAPH_MAX_LAYERS 256u
+typedef struct lm_model_moe_layer_binding {
+    uint64_t router_tensor;
+    uint64_t gate_up_tensor;
+    uint64_t down_tensor;
+} lm_model_moe_layer_binding;
+
+typedef struct lm_model_moe_graph_binding {
+    uint32_t layer_count;
+    uint32_t expert_count;
+    uint32_t experts_per_token;
+    lm_model_moe_layer_binding layers[LM_MOE_GRAPH_MAX_LAYERS];
+} lm_model_moe_graph_binding;
+
+lm_status lm_model_build_mixtral_moe_graph(const lm_model_file *model,
+                                           uint32_t expert_count, uint32_t experts_per_token,
+                                           lm_model_moe_graph_binding *out_binding);
+lm_status lm_model_execute_mixtral_moe_layer_f32_router_q4_k_cpu(
+    const lm_model_file *model, const lm_model_moe_graph_binding *graph, uint32_t layer_index,
+    uint32_t hidden_size, uint32_t intermediate_size,
+    void *router_scratch, uint64_t router_scratch_bytes,
+    void *gate_up_scratch, uint64_t gate_up_scratch_bytes,
+    void *down_scratch, uint64_t down_scratch_bytes,
+    const float *input, float *out_hidden, size_t out_hidden_count);
+
 typedef enum lm_decoder_tensor_role {
     LM_DECODER_TENSOR_TOKEN_EMBEDDING = 0,
     LM_DECODER_TENSOR_OUTPUT,

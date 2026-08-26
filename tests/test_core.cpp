@@ -401,11 +401,24 @@ static void test_model_bound_moe_q4_k() {
     const uint64_t down_expert_bytes = 256ull * 144u;
     const uint64_t gate_tensor_bytes = gate_expert_bytes * experts;
     const uint64_t down_tensor_bytes = down_expert_bytes * experts;
+    const uint64_t router_tensor_bytes = static_cast<uint64_t>(experts) * hidden * sizeof(float);
     auto put_u32 = [](std::vector<unsigned char> *bytes, uint32_t value) {
         for (unsigned i = 0u; i < 4u; ++i) bytes->push_back(static_cast<unsigned char>((value >> (8u * i)) & 0xffu));
     };
     auto put_u64 = [](std::vector<unsigned char> *bytes, uint64_t value) {
         for (unsigned i = 0u; i < 8u; ++i) bytes->push_back(static_cast<unsigned char>((value >> (8u * i)) & 0xffu));
+    };
+    auto put_rank2 = [&put_u32, &put_u64](std::vector<unsigned char> *bytes, const char *name,
+                                            uint64_t first_dimension, uint64_t second_dimension,
+                                            uint32_t type, uint64_t offset) {
+        const size_t length = std::strlen(name);
+        put_u64(bytes, length);
+        bytes->insert(bytes->end(), name, name + length);
+        put_u32(bytes, 2u);
+        put_u64(bytes, first_dimension);
+        put_u64(bytes, second_dimension);
+        put_u32(bytes, type);
+        put_u64(bytes, offset);
     };
     auto put_rank3 = [&put_u32, &put_u64](std::vector<unsigned char> *bytes, const char *name,
                                             uint64_t first_dimension, uint64_t second_dimension,
@@ -421,11 +434,12 @@ static void test_model_bound_moe_q4_k() {
         put_u64(bytes, offset);
     };
     std::vector<unsigned char> gguf(24u, 0u);
-    gguf[0] = 'G'; gguf[1] = 'G'; gguf[2] = 'U'; gguf[3] = 'F'; gguf[4] = 3u; gguf[8] = 2u;
+    gguf[0] = 'G'; gguf[1] = 'G'; gguf[2] = 'U'; gguf[3] = 'F'; gguf[4] = 3u; gguf[8] = 3u;
     put_rank3(&gguf, "layers.0.feed_forward.experts.w1", hidden, intermediate * 2u, 0u);
     put_rank3(&gguf, "layers.0.feed_forward.experts.w2", intermediate, hidden, gate_tensor_bytes);
+    put_rank2(&gguf, "blk.0.ffn_router.weight", experts, hidden, LM_DTYPE_F32, gate_tensor_bytes + down_tensor_bytes);
     const size_t header_size = (gguf.size() + 31u) & ~static_cast<size_t>(31u);
-    gguf.resize(header_size + static_cast<size_t>(gate_tensor_bytes + down_tensor_bytes), 0u);
+    gguf.resize(header_size + static_cast<size_t>(gate_tensor_bytes + down_tensor_bytes + router_tensor_bytes), 0u);
     for (uint32_t tensor = 0u; tensor < 2u; ++tensor) {
         const size_t tensor_base = header_size + static_cast<size_t>(tensor == 0u ? 0u : gate_tensor_bytes);
         const uint64_t tensor_expert_bytes = tensor == 0u ? gate_expert_bytes : down_expert_bytes;
@@ -442,6 +456,8 @@ static void test_model_bound_moe_q4_k() {
             }
         }
     }
+    float *router_data = reinterpret_cast<float *>(gguf.data() + header_size + gate_tensor_bytes + down_tensor_bytes);
+    for (uint32_t i = 0u; i < hidden; ++i) router_data[hidden + i] = 1.0f;
     const char *path = "test-model-bound-moe.gguf";
     {
         std::ofstream file(path, std::ios::binary);
@@ -479,6 +495,42 @@ static void test_model_bound_moe_q4_k() {
     assert(lm_model_moe_selected_expert_mlp_q4_k(model, 0u, 1u, &route, 0u, hidden, intermediate,
                                                  gate_scratch.data(), gate_scratch.size() - 1u, down_scratch.data(),
                                                  down_scratch.size(), input.data(), actual.data(), actual.size()) == LM_ERR_CAPACITY);
+    lm_model_moe_layer_config moe_config{};
+    moe_config.router_tensor = 2u;
+    moe_config.gate_up_tensor = 0u;
+    moe_config.down_tensor = 1u;
+    moe_config.expected_layer = 0u;
+    moe_config.hidden_size = hidden;
+    moe_config.intermediate_size = intermediate;
+    moe_config.expert_count = experts;
+    moe_config.experts_per_token = 1u;
+    moe_config.route_policy = LM_MOE_SOFTMAX_SELECTED_ONLY;
+    std::vector<unsigned char> router_scratch(static_cast<size_t>(router_tensor_bytes));
+    std::fill(actual.begin(), actual.end(), 0.0f);
+    assert(lm_model_execute_moe_layer_f32_router_q4_k_cpu(model, &moe_config, router_scratch.data(), router_scratch.size(),
+                                                          gate_scratch.data(), gate_scratch.size(), down_scratch.data(),
+                                                          down_scratch.size(), input.data(), actual.data(), actual.size()) == LM_OK);
+    for (uint32_t i = 0u; i < hidden; ++i) assert(actual[i] == expected[i]);
+    assert(lm_model_execute_moe_layer_f32_router_q4_k_cpu(model, &moe_config, router_scratch.data(), router_scratch.size() - 1u,
+                                                          gate_scratch.data(), gate_scratch.size(), down_scratch.data(),
+                                                          down_scratch.size(), input.data(), actual.data(), actual.size()) == LM_ERR_CAPACITY);
+    lm_model_moe_graph_binding moe_graph{};
+    assert(lm_model_build_mixtral_moe_graph(model, experts, 1u, &moe_graph) == LM_OK);
+    assert(moe_graph.layer_count == 1u && moe_graph.expert_count == experts &&
+           moe_graph.experts_per_token == 1u && moe_graph.layers[0].router_tensor == 2u &&
+           moe_graph.layers[0].gate_up_tensor == 0u && moe_graph.layers[0].down_tensor == 1u);
+    std::fill(actual.begin(), actual.end(), 0.0f);
+    assert(lm_model_execute_mixtral_moe_layer_f32_router_q4_k_cpu(model, &moe_graph, 0u, hidden, intermediate,
+                                                                   router_scratch.data(), router_scratch.size(),
+                                                                   gate_scratch.data(), gate_scratch.size(),
+                                                                   down_scratch.data(), down_scratch.size(), input.data(),
+                                                                   actual.data(), actual.size()) == LM_OK);
+    for (uint32_t i = 0u; i < hidden; ++i) assert(actual[i] == expected[i]);
+    assert(lm_model_execute_mixtral_moe_layer_f32_router_q4_k_cpu(model, &moe_graph, 1u, hidden, intermediate,
+                                                                   router_scratch.data(), router_scratch.size(),
+                                                                   gate_scratch.data(), gate_scratch.size(),
+                                                                   down_scratch.data(), down_scratch.size(), input.data(),
+                                                                   actual.data(), actual.size()) == LM_ERR_ARGUMENT);
     lm_model_close(model);
     std::remove(path);
 }

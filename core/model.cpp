@@ -33,6 +33,27 @@ bool finite_array(const float *data, size_t count) {
     return true;
 }
 
+bool parse_mixtral_router_name(const char *name, uint32_t *layer) {
+    if (!name || !layer) return false;
+    const char prefix[] = "blk.";
+    const char suffix[] = ".ffn_router.weight";
+    const size_t prefix_bytes = sizeof(prefix) - 1u;
+    const size_t suffix_bytes = sizeof(suffix) - 1u;
+    if (std::strncmp(name, prefix, prefix_bytes) != 0) return false;
+    const char *cursor = name + prefix_bytes;
+    if (*cursor < '0' || *cursor > '9') return false;
+    uint64_t value = 0u;
+    while (*cursor >= '0' && *cursor <= '9') {
+        const uint64_t digit = static_cast<uint64_t>(*cursor - '0');
+        if (value > (UINT32_MAX - digit) / 10u) return false;
+        value = value * 10u + digit;
+        ++cursor;
+    }
+    if (std::strncmp(cursor, suffix, suffix_bytes) != 0 || cursor[suffix_bytes] != '\0') return false;
+    *layer = static_cast<uint32_t>(value);
+    return true;
+}
+
 void set_error(char *dst, size_t cap, const char *text) {
     if (!dst || cap == 0u) return;
     std::strncpy(dst, text, cap - 1u);
@@ -1109,6 +1130,38 @@ lm_status lm_model_moe_route_f32_cpu(const lm_model_file *model, uint64_t router
     return lm_cpu_moe_route(logits.data(), expert_count, experts_per_token, policy, out_route);
 }
 
+lm_status lm_model_execute_moe_layer_f32_router_q4_k_cpu(const lm_model_file *model,
+                                                         const lm_model_moe_layer_config *config,
+                                                         void *router_scratch, uint64_t router_scratch_bytes,
+                                                         void *gate_up_scratch, uint64_t gate_up_scratch_bytes,
+                                                         void *down_scratch, uint64_t down_scratch_bytes,
+                                                         const float *input, float *out_hidden,
+                                                         size_t out_hidden_count) {
+    if (!model || !config || !router_scratch || !gate_up_scratch || !down_scratch || !input || !out_hidden ||
+        out_hidden_count < config->hidden_size || config->hidden_size == 0u || config->intermediate_size == 0u ||
+        config->expert_count == 0u || config->experts_per_token == 0u || config->experts_per_token > 16u)
+        return LM_ERR_ARGUMENT;
+    lm_moe_route route{};
+    lm_status status = lm_model_moe_route_f32_cpu(model, config->router_tensor, router_scratch,
+                                                  router_scratch_bytes, input, config->hidden_size,
+                                                  config->expert_count, config->experts_per_token,
+                                                  config->route_policy, &route);
+    if (status != LM_OK) return status;
+    std::vector<float> selected;
+    try {
+        selected.assign(static_cast<size_t>(config->experts_per_token) * config->hidden_size, 0.0f);
+    } catch (const std::bad_alloc &) {
+        return LM_ERR_CAPACITY;
+    }
+    status = lm_model_moe_selected_expert_mlp_q4_k(model, config->gate_up_tensor, config->down_tensor,
+                                                   &route, config->expected_layer, config->hidden_size,
+                                                   config->intermediate_size, gate_up_scratch,
+                                                   gate_up_scratch_bytes, down_scratch, down_scratch_bytes,
+                                                   input, selected.data(), selected.size());
+    if (status != LM_OK) return status;
+    return lm_cpu_moe_combine(&route, selected.data(), config->hidden_size, out_hidden);
+}
+
 static lm_status validate_q4_k_binding_matvec(const lm_model_tensor_binding *binding,
                                                 uint32_t rows, uint32_t columns,
                                                 uint64_t *payload_bytes, uint32_t *blocks_per_row) {
@@ -1336,6 +1389,79 @@ lm_status lm_model_build_llama_graph(const lm_model_file *model,
     for (uint32_t layer = 0u; layer < out_binding->layer_count; ++layer)
         if (layer_masks[layer] != layer_required) return LM_ERR_UNSUPPORTED;
     return LM_OK;
+}
+
+lm_status lm_model_build_mixtral_moe_graph(const lm_model_file *model,
+                                           uint32_t expert_count, uint32_t experts_per_token,
+                                           lm_model_moe_graph_binding *out_binding) {
+    if (!model || !out_binding || model->info.format != LM_MODEL_GGUF || expert_count == 0u ||
+        experts_per_token == 0u || experts_per_token > expert_count || experts_per_token > 16u)
+        return LM_ERR_ARGUMENT;
+    std::memset(out_binding, 0xff, sizeof(*out_binding));
+    out_binding->layer_count = 0u;
+    out_binding->expert_count = expert_count;
+    out_binding->experts_per_token = experts_per_token;
+    uint8_t router_seen[LM_MOE_GRAPH_MAX_LAYERS] = {};
+    uint8_t gate_seen[LM_MOE_GRAPH_MAX_LAYERS] = {};
+    uint8_t down_seen[LM_MOE_GRAPH_MAX_LAYERS] = {};
+    for (size_t i = 0u; i < model->tensors.size(); ++i) {
+        const lm_model_tensor_info &descriptor = model->tensors[i];
+        uint32_t router_layer = 0u;
+        if (parse_mixtral_router_name(descriptor.name, &router_layer)) {
+            if (router_layer >= LM_MOE_GRAPH_MAX_LAYERS || router_seen[router_layer] != 0u ||
+                descriptor.rank != 2u || descriptor.type != LM_DTYPE_F32) return LM_ERR_UNSUPPORTED;
+            out_binding->layers[router_layer].router_tensor = static_cast<uint64_t>(i);
+            router_seen[router_layer] = 1u;
+            if (router_layer + 1u > out_binding->layer_count) out_binding->layer_count = router_layer + 1u;
+            continue;
+        }
+        lm_moe_tensor_mapping mapping{};
+        const lm_status mapped = lm_moe_map_mixtral_tensor(&descriptor, expert_count, &mapping);
+        if (mapped == LM_ERR_UNSUPPORTED) continue;
+        if (mapped != LM_OK || mapping.layer_index >= LM_MOE_GRAPH_MAX_LAYERS) return mapped;
+        lm_model_moe_layer_binding &layer = out_binding->layers[mapping.layer_index];
+        if (mapping.role == LM_MOE_TENSOR_GATE_UP_EXPERT) {
+            if (gate_seen[mapping.layer_index] != 0u) return LM_ERR_PARSE;
+            layer.gate_up_tensor = static_cast<uint64_t>(i);
+            gate_seen[mapping.layer_index] = 1u;
+        } else {
+            if (down_seen[mapping.layer_index] != 0u) return LM_ERR_PARSE;
+            layer.down_tensor = static_cast<uint64_t>(i);
+            down_seen[mapping.layer_index] = 1u;
+        }
+        if (mapping.layer_index + 1u > out_binding->layer_count)
+            out_binding->layer_count = mapping.layer_index + 1u;
+    }
+    if (out_binding->layer_count == 0u) return LM_ERR_UNSUPPORTED;
+    for (uint32_t layer = 0u; layer < out_binding->layer_count; ++layer)
+        if (router_seen[layer] == 0u || gate_seen[layer] == 0u || down_seen[layer] == 0u)
+            return LM_ERR_UNSUPPORTED;
+    return LM_OK;
+}
+
+lm_status lm_model_execute_mixtral_moe_layer_f32_router_q4_k_cpu(
+    const lm_model_file *model, const lm_model_moe_graph_binding *graph, uint32_t layer_index,
+    uint32_t hidden_size, uint32_t intermediate_size,
+    void *router_scratch, uint64_t router_scratch_bytes,
+    void *gate_up_scratch, uint64_t gate_up_scratch_bytes,
+    void *down_scratch, uint64_t down_scratch_bytes,
+    const float *input, float *out_hidden, size_t out_hidden_count) {
+    if (!model || !graph || layer_index >= graph->layer_count || graph->layer_count == 0u ||
+        graph->layer_count > LM_MOE_GRAPH_MAX_LAYERS) return LM_ERR_ARGUMENT;
+    lm_model_moe_layer_config config{};
+    config.router_tensor = graph->layers[layer_index].router_tensor;
+    config.gate_up_tensor = graph->layers[layer_index].gate_up_tensor;
+    config.down_tensor = graph->layers[layer_index].down_tensor;
+    config.expected_layer = layer_index;
+    config.hidden_size = hidden_size;
+    config.intermediate_size = intermediate_size;
+    config.expert_count = graph->expert_count;
+    config.experts_per_token = graph->experts_per_token;
+    config.route_policy = LM_MOE_SOFTMAX_SELECTED_ONLY;
+    return lm_model_execute_moe_layer_f32_router_q4_k_cpu(model, &config, router_scratch, router_scratch_bytes,
+                                                         gate_up_scratch, gate_up_scratch_bytes,
+                                                         down_scratch, down_scratch_bytes, input,
+                                                         out_hidden, out_hidden_count);
 }
 
 lm_status lm_cpu_dot_f32(const float *a, const float *b, size_t count, float *out) {
