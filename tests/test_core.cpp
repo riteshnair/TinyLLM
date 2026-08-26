@@ -1346,6 +1346,54 @@ static void test_safetensors_parser() {
     std::remove(bad_path);
 }
 
+static void test_tokenizer_json_bpe() {
+    const char *path = "test-tokenizer.json";
+    const char *json = "{\"version\":\"1.0\",\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0,\"b\":1,\"c\":2,\"ab\":3,\"bc\":4,\"abc\":5,\"<unk>\":6},\"merges\":[\"b c\",[\"a\",\"b\"],[\"a\",\"bc\"]],\"unk_token\":\"<unk>\"},\"normalizer\":null,\"pre_tokenizer\":null,\"post_processor\":null,\"decoder\":null,\"added_tokens\":[]}";
+    { std::ofstream file(path, std::ios::binary); file.write(json, static_cast<std::streamsize>(std::strlen(json))); }
+    lm_tokenizer *tokenizer = nullptr;
+    char error[128] = {};
+    assert(lm_tokenizer_open_json(path, &tokenizer, error, sizeof(error)) == LM_OK);
+    lm_tokenizer_info info{};
+    assert(lm_tokenizer_get_info(tokenizer, &info) == LM_OK && info.vocabulary_size == 7u && info.merge_count == 3u && info.raw_utf8_bpe == 1u);
+    uint32_t encoded[4] = {};
+    size_t encoded_count = 0u;
+    assert(lm_tokenizer_encode(tokenizer, "abc", 3u, encoded, 4u, &encoded_count) == LM_OK && encoded_count == 1u && encoded[0] == 5u);
+    char decoded[8] = {};
+    size_t decoded_bytes = 0u;
+    assert(lm_tokenizer_decode(tokenizer, encoded, encoded_count, decoded, sizeof(decoded), &decoded_bytes) == LM_OK && decoded_bytes == 3u && std::strcmp(decoded, "abc") == 0);
+    assert(lm_tokenizer_encode(tokenizer, "x", 1u, encoded, 4u, &encoded_count) == LM_OK && encoded_count == 1u && encoded[0] == 6u);
+    assert(lm_tokenizer_decode(tokenizer, encoded, encoded_count, nullptr, 0u, &decoded_bytes) == LM_OK && decoded_bytes == 5u);
+    assert(lm_tokenizer_decode(tokenizer, encoded, encoded_count, decoded, 5u, &decoded_bytes) == LM_ERR_CAPACITY);
+    const char invalid_utf8[] = {static_cast<char>(0xc3), static_cast<char>(0x28)};
+    assert(lm_tokenizer_encode(tokenizer, invalid_utf8, sizeof(invalid_utf8), encoded, 4u, &encoded_count) == LM_ERR_PARSE);
+    const char *model_path = "test-tokenizer-model.safetensors";
+    const char *model_json = "{\"x\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    { std::ofstream file(model_path, std::ios::binary); const uint64_t bytes = std::strlen(model_json); file.write(reinterpret_cast<const char *>(&bytes), sizeof(bytes)); file.write(model_json, static_cast<std::streamsize>(bytes)); const float value = 0.0f; file.write(reinterpret_cast<const char *>(&value), sizeof(value)); }
+    lm_model_file *model = nullptr;
+    assert(lm_model_open(model_path, &model, error, sizeof(error)) == LM_OK);
+    assert(lm_model_set_tokenizer_json(model, path, error, sizeof(error)) == LM_OK);
+    uint32_t model_token_count = 0u;
+    assert(lm_model_token_count(model, &model_token_count) == LM_OK && model_token_count == 7u);
+    assert(lm_model_token_encode(model, "abc", 3u, encoded, 4u, &encoded_count) == LM_OK && encoded_count == 1u && encoded[0] == 5u);
+    char model_token[8] = {};
+    assert(lm_model_token_at(model, 6u, model_token, sizeof(model_token), &decoded_bytes) == LM_OK && decoded_bytes == 5u && std::strcmp(model_token, "<unk>") == 0);
+    lm_model_close(model);
+    lm_tokenizer_destroy(tokenizer);
+    std::remove(path);
+    std::remove(model_path);
+
+    const char *unsupported_path = "test-tokenizer-unsupported.json";
+    const char *unsupported_json = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]},\"normalizer\":{\"type\":\"Lowercase\"}}";
+    { std::ofstream file(unsupported_path, std::ios::binary); file.write(unsupported_json, static_cast<std::streamsize>(std::strlen(unsupported_json))); }
+    assert(lm_tokenizer_open_json(unsupported_path, &tokenizer, error, sizeof(error)) == LM_ERR_UNSUPPORTED && tokenizer == nullptr);
+    std::remove(unsupported_path);
+    const char *bad_path = "test-tokenizer-bad.json";
+    const char *bad_json = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[\"a b\"]}}";
+    { std::ofstream file(bad_path, std::ios::binary); file.write(bad_json, static_cast<std::streamsize>(std::strlen(bad_json))); }
+    assert(lm_tokenizer_open_json(bad_path, &tokenizer, error, sizeof(error)) == LM_ERR_PARSE && tokenizer == nullptr);
+    std::remove(bad_path);
+}
+
 static void test_tokenizer() {
     auto put_u32 = [](std::vector<unsigned char> *bytes, uint32_t value) {
         for (unsigned i = 0u; i < 4u; ++i) bytes->push_back(static_cast<unsigned char>((value >> (8u * i)) & 0xffu));
@@ -1877,6 +1925,7 @@ int main() {
     test_safetensors_parser();
     test_safetensors_native_mlp();
     test_model_bound_f32_router();
+    test_tokenizer_json_bpe();
     test_tokenizer();
     test_sampling();
     test_cpu_decoder();

@@ -98,6 +98,13 @@ lm_status lm_rocr_runtime_probe(lm_rocr_runtime_info *out_info);
 
 typedef struct lm_file lm_file;
 typedef struct lm_model_file lm_model_file;
+typedef struct lm_tokenizer lm_tokenizer;
+
+typedef struct lm_tokenizer_info {
+    uint32_t vocabulary_size;
+    uint32_t merge_count;
+    uint8_t raw_utf8_bpe;
+} lm_tokenizer_info;
 
 lm_status lm_file_open(const char *path, lm_file **out_file);
 void lm_file_close(lm_file *file);
@@ -356,6 +363,9 @@ lm_status lm_model_open_sharded(const char *const *paths, size_t path_count,
                                 lm_model_file **out_model, char *error_text,
                                 size_t error_capacity);
 void lm_model_close(lm_model_file *model);
+/* Replaces the model’s optional tokenizer with an owned tokenizer.json BPE handle. */
+lm_status lm_model_set_tokenizer_json(lm_model_file *model, const char *path,
+                                      char *error_text, size_t error_capacity);
 lm_status lm_model_get_info(const lm_model_file *model, lm_model_info *out_info);
 lm_status lm_model_get_architecture(const lm_model_file *model, lm_model_architecture *out_architecture);
 lm_status lm_model_tensor_info_at(const lm_model_file *model, uint64_t index, lm_model_tensor_info *out_info);
@@ -368,6 +378,18 @@ lm_status lm_model_token_encode(const lm_model_file *model, const char *text,
 lm_status lm_model_token_decode(const lm_model_file *model, const uint32_t *tokens,
                                 size_t token_count, char *out_text,
                                 size_t out_capacity, size_t *out_bytes);
+/* Opens a tokenizer.json only when it declares a strict raw-UTF-8 BPE model.
+ * The tokenizer owns parsed vocabulary/ranks; it does not own or modify the file. */
+lm_status lm_tokenizer_open_json(const char *path, lm_tokenizer **out_tokenizer,
+                                 char *error_text, size_t error_capacity);
+void lm_tokenizer_destroy(lm_tokenizer *tokenizer);
+lm_status lm_tokenizer_get_info(const lm_tokenizer *tokenizer, lm_tokenizer_info *out_info);
+lm_status lm_tokenizer_encode(const lm_tokenizer *tokenizer, const char *text,
+                              size_t text_bytes, uint32_t *out_tokens,
+                              size_t token_capacity, size_t *out_count);
+lm_status lm_tokenizer_decode(const lm_tokenizer *tokenizer, const uint32_t *tokens,
+                              size_t token_count, char *out_text,
+                              size_t out_capacity, size_t *out_bytes);
 /* Single-file compatibility lookup. Returns LM_ERR_UNSUPPORTED for a sharded model;
  * use lm_model_tensor_span_at so the owning file header is applied. */
 lm_status lm_model_tensor_span(const lm_model_file *model, uint64_t relative_offset, uint64_t bytes, lm_file_span *out_span);

@@ -21,6 +21,7 @@ struct lm_model_file {
     std::vector<std::string> tokens;
     std::vector<uint64_t> shard_headers;
     std::vector<uint64_t> shard_sizes;
+    lm_tokenizer *tokenizer = nullptr;
 };
 
 namespace {
@@ -1003,6 +1004,7 @@ lm_status lm_model_open_sharded(const char *const *paths, size_t path_count,
 
 void lm_model_close(lm_model_file *model) {
     if (!model) return;
+    if (model->tokenizer) lm_tokenizer_destroy(model->tokenizer);
     if (model->shards) lm_file_shard_set_close(model->shards);
     else lm_file_close(model->file);
     delete model;
@@ -1028,8 +1030,26 @@ lm_status lm_model_tensor_info_at(const lm_model_file *model, uint64_t index, lm
     return LM_OK;
 }
 
+lm_status lm_model_set_tokenizer_json(lm_model_file *model, const char *path,
+                                       char *error_text, size_t error_capacity) {
+    if (!model || !path) return LM_ERR_ARGUMENT;
+    lm_tokenizer *tokenizer = nullptr;
+    const lm_status opened = lm_tokenizer_open_json(path, &tokenizer, error_text, error_capacity);
+    if (opened != LM_OK) return opened;
+    if (model->tokenizer) lm_tokenizer_destroy(model->tokenizer);
+    model->tokenizer = tokenizer;
+    return LM_OK;
+}
+
 lm_status lm_model_token_count(const lm_model_file *model, uint32_t *out_count) {
     if (!model || !out_count) return LM_ERR_ARGUMENT;
+    if (model->tokenizer) {
+        lm_tokenizer_info info{};
+        const lm_status status = lm_tokenizer_get_info(model->tokenizer, &info);
+        if (status != LM_OK) return status;
+        *out_count = info.vocabulary_size;
+        return LM_OK;
+    }
     if (model->tokens.empty()) return LM_ERR_UNSUPPORTED;
     if (model->tokens.size() > UINT32_MAX) return LM_ERR_CAPACITY;
     *out_count = static_cast<uint32_t>(model->tokens.size());
@@ -1039,6 +1059,15 @@ lm_status lm_model_token_count(const lm_model_file *model, uint32_t *out_count) 
 lm_status lm_model_token_at(const lm_model_file *model, uint32_t token_id,
                             char *out_token, size_t out_capacity, size_t *out_bytes) {
     if (!model || !out_bytes) return LM_ERR_ARGUMENT;
+    if (model->tokenizer) {
+        size_t bytes = 0u;
+        const lm_status status = lm_tokenizer_decode(model->tokenizer, &token_id, 1u, nullptr, 0u, &bytes);
+        if (status != LM_OK) return status;
+        *out_bytes = bytes;
+        if (!out_token && out_capacity == 0u) return LM_OK;
+        if (!out_token || out_capacity <= bytes) return LM_ERR_CAPACITY;
+        return lm_tokenizer_decode(model->tokenizer, &token_id, 1u, out_token, out_capacity, out_bytes);
+    }
     if (model->tokens.empty()) return LM_ERR_UNSUPPORTED;
     if (token_id >= model->tokens.size()) return LM_ERR_RANGE;
     const std::string &token = model->tokens[token_id];
@@ -1054,6 +1083,7 @@ lm_status lm_model_token_encode(const lm_model_file *model, const char *text,
                                 size_t text_bytes, uint32_t *out_tokens,
                                 size_t token_capacity, size_t *out_count) {
     if (!model || !out_count || (!text && text_bytes != 0u)) return LM_ERR_ARGUMENT;
+    if (model->tokenizer) return lm_tokenizer_encode(model->tokenizer, text, text_bytes, out_tokens, token_capacity, out_count);
     if (model->tokens.empty()) return LM_ERR_UNSUPPORTED;
     if (text_bytes == 0u) { *out_count = 0u; return LM_OK; }
     if (!out_tokens || token_capacity == 0u) return LM_ERR_CAPACITY;
@@ -1089,6 +1119,7 @@ lm_status lm_model_token_decode(const lm_model_file *model, const uint32_t *toke
                                 size_t token_count, char *out_text,
                                 size_t out_capacity, size_t *out_bytes) {
     if (!model || !out_bytes || (!tokens && token_count != 0u)) return LM_ERR_ARGUMENT;
+    if (model->tokenizer) return lm_tokenizer_decode(model->tokenizer, tokens, token_count, out_text, out_capacity, out_bytes);
     if (model->tokens.empty()) return LM_ERR_UNSUPPORTED;
     size_t total = 0u;
     for (size_t i = 0u; i < token_count; ++i) {
