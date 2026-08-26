@@ -565,6 +565,22 @@ lm_status lm_model_execute_native_step(const lm_model_file *model,
                                        float *out_logits,
                                        size_t logits_count);
 
+typedef struct lm_native_transformer_config {
+    lm_native_step_config step;
+} lm_native_transformer_config;
+
+lm_status lm_model_execute_native_transformer(const lm_model_file *model,
+                                              const lm_decoder_graph_binding *graph,
+                                              const lm_native_transformer_config *config,
+                                              uint32_t token_id,
+                                              lm_kv_cache *const *layer_caches,
+                                              uint32_t cache_count,
+                                              uint32_t page_id,
+                                              void *packed_scratch,
+                                              uint64_t packed_scratch_bytes,
+                                              float *out_logits,
+                                              size_t logits_count);
+
 /* Bounded local generation for the narrow profile; prompt IDs must come from the model tokenizer. */
 typedef struct lm_native_generation_config {
     lm_native_step_config step;

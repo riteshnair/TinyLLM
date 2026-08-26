@@ -180,6 +180,60 @@ lm_status profile_matvec(const lm_model_file *model, uint64_t index,
                                          packed_scratch_bytes, rows, columns, input, out);
 }
 
+lm_status profile_mlp_hidden(const lm_model_file *model, const lm_decoder_graph_binding *graph,
+                            const lm_native_mlp_config *config, const float *input,
+                            void *packed_scratch, uint64_t packed_scratch_bytes, float *out) {
+    if (!model || !graph || !config || !input || !packed_scratch || !out ||
+        config->layer_index >= graph->layer_count || !finite_array(input, config->hidden_size))
+        return LM_ERR_ARGUMENT;
+    const lm_decoder_layer_binding &layer = graph->layers[config->layer_index];
+    const uint64_t matrix_indices[] = {layer.ffn_gate, layer.ffn_up, layer.ffn_down};
+    const uint32_t matrix_rows[] = {config->intermediate_size, config->intermediate_size, config->hidden_size};
+    const uint32_t matrix_columns[] = {config->hidden_size, config->hidden_size, config->intermediate_size};
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        uint64_t payload = 0u;
+        const lm_status valid = profile_matrix(model, matrix_indices[i], matrix_rows[i],
+                                               matrix_columns[i], config->matrix_format, &payload);
+        if (valid != LM_OK) return valid;
+        if (packed_scratch_bytes < payload) return LM_ERR_CAPACITY;
+    }
+    std::vector<float> gamma, normed, gate, up, activated, down;
+    try {
+        normed.assign(config->hidden_size, 0.0f);
+        gate.assign(config->intermediate_size, 0.0f);
+        up.assign(config->intermediate_size, 0.0f);
+        activated.assign(config->intermediate_size, 0.0f);
+        down.assign(config->hidden_size, 0.0f);
+    } catch (const std::bad_alloc &) {
+        return LM_ERR_CAPACITY;
+    }
+    lm_status status = profile_vector(model, layer.ffn_norm, config->hidden_size, &gamma);
+    if (status != LM_OK) return status;
+    float mean_square = 0.0f;
+    for (uint32_t i = 0u; i < config->hidden_size; ++i) mean_square += input[i] * input[i];
+    mean_square /= static_cast<float>(config->hidden_size);
+    const float scale = 1.0f / std::sqrt(mean_square + config->rms_epsilon);
+    if (!std::isfinite(scale)) return LM_ERR_RANGE;
+    for (uint32_t i = 0u; i < config->hidden_size; ++i) normed[i] = input[i] * scale * gamma[i];
+    if (!finite_array(normed.data(), normed.size())) return LM_ERR_RANGE;
+    status = profile_matvec(model, layer.ffn_gate, &config->matvec, packed_scratch, packed_scratch_bytes,
+                            config->intermediate_size, config->hidden_size, normed.data(), gate.data());
+    if (status != LM_OK) return status;
+    status = profile_matvec(model, layer.ffn_up, &config->matvec, packed_scratch, packed_scratch_bytes,
+                            config->intermediate_size, config->hidden_size, normed.data(), up.data());
+    if (status != LM_OK) return status;
+    for (uint32_t i = 0u; i < config->intermediate_size; ++i) {
+        const float sigmoid = 1.0f / (1.0f + std::exp(-gate[i]));
+        activated[i] = gate[i] * sigmoid * up[i];
+    }
+    if (!finite_array(activated.data(), activated.size())) return LM_ERR_RANGE;
+    status = profile_matvec(model, layer.ffn_down, &config->matvec, packed_scratch, packed_scratch_bytes,
+                            config->hidden_size, config->intermediate_size, activated.data(), down.data());
+    if (status != LM_OK) return status;
+    for (uint32_t i = 0u; i < config->hidden_size; ++i) out[i] = input[i] + down[i];
+    return finite_array(out, config->hidden_size) ? LM_OK : LM_ERR_RANGE;
+}
+
 } // namespace
 
 lm_status lm_model_execute_native_mlp_logits(const lm_model_file *model,
@@ -409,16 +463,12 @@ lm_status lm_model_execute_native_step(const lm_model_file *model,
                                       config->vocab_size, config->matrix_format, &embedding_payload);
     if (status != LM_OK) return status;
     if (packed_scratch_bytes < embedding_payload) return LM_ERR_CAPACITY;
-    std::vector<float> one_hot, embedding, attended, gate, up, activated, down, normed, ffn_norm, output_norm;
+    std::vector<float> one_hot, embedding, attended, normed, output_norm;
     try {
         one_hot.assign(config->vocab_size, 0.0f);
         one_hot[token_id] = 1.0f;
         embedding.assign(config->hidden_size, 0.0f);
         attended.assign(config->hidden_size, 0.0f);
-        gate.assign(config->intermediate_size, 0.0f);
-        up.assign(config->intermediate_size, 0.0f);
-        activated.assign(config->intermediate_size, 0.0f);
-        down.assign(config->hidden_size, 0.0f);
         normed.assign(config->hidden_size, 0.0f);
     } catch (const std::bad_alloc &) {
         return LM_ERR_CAPACITY;
@@ -431,56 +481,127 @@ lm_status lm_model_execute_native_step(const lm_model_file *model,
                                                page_id, packed_scratch, packed_scratch_bytes,
                                                attended.data());
     if (status != LM_OK) return status;
-    const lm_decoder_layer_binding &layer = graph->layers[config->layer_index];
-    const uint64_t mlp_indices[] = {layer.ffn_gate, layer.ffn_up, layer.ffn_down, graph->output};
-    const uint32_t mlp_rows[] = {config->intermediate_size, config->intermediate_size,
-                                 config->hidden_size, config->vocab_size};
-    const uint32_t mlp_columns[] = {config->hidden_size, config->hidden_size,
-                                    config->intermediate_size, config->hidden_size};
-    for (uint32_t i = 0u; i < 4u; ++i) {
-        uint64_t payload = 0u;
-        status = profile_matrix(model, mlp_indices[i], mlp_rows[i], mlp_columns[i],
-                                config->matrix_format, &payload);
-        if (status != LM_OK) return status;
-        if (packed_scratch_bytes < payload) return LM_ERR_CAPACITY;
+    std::vector<float> mlp_output;
+    try {
+        mlp_output.assign(config->hidden_size, 0.0f);
+    } catch (const std::bad_alloc &) {
+        return LM_ERR_CAPACITY;
     }
-    status = profile_vector(model, layer.ffn_norm, config->hidden_size, &ffn_norm);
+    lm_native_mlp_config mlp{};
+    mlp.matvec = config->matvec;
+    mlp.layer_index = config->layer_index;
+    mlp.vocab_size = config->vocab_size;
+    mlp.hidden_size = config->hidden_size;
+    mlp.intermediate_size = config->intermediate_size;
+    mlp.matrix_format = config->matrix_format;
+    mlp.rms_epsilon = config->rms_epsilon;
+    status = profile_mlp_hidden(model, graph, &mlp, attended.data(), packed_scratch,
+                                packed_scratch_bytes, mlp_output.data());
     if (status != LM_OK) return status;
     status = profile_vector(model, graph->output_norm, config->hidden_size, &output_norm);
     if (status != LM_OK) return status;
     float mean_square = 0.0f;
-    for (uint32_t i = 0u; i < config->hidden_size; ++i) mean_square += attended[i] * attended[i];
-    mean_square /= static_cast<float>(config->hidden_size);
-    const float scale = 1.0f / std::sqrt(mean_square + config->rms_epsilon);
-    if (!std::isfinite(scale)) return LM_ERR_RANGE;
-    for (uint32_t i = 0u; i < config->hidden_size; ++i) normed[i] = attended[i] * scale * ffn_norm[i];
-    if (!finite_array(normed.data(), normed.size())) return LM_ERR_RANGE;
-    status = profile_matvec(model, layer.ffn_gate, &config->matvec, packed_scratch, packed_scratch_bytes,
-                            config->intermediate_size, config->hidden_size, normed.data(), gate.data());
-    if (status != LM_OK) return status;
-    status = profile_matvec(model, layer.ffn_up, &config->matvec, packed_scratch, packed_scratch_bytes,
-                            config->intermediate_size, config->hidden_size, normed.data(), up.data());
-    if (status != LM_OK) return status;
-    for (uint32_t i = 0u; i < config->intermediate_size; ++i) {
-        const float sigmoid = 1.0f / (1.0f + std::exp(-gate[i]));
-        activated[i] = gate[i] * sigmoid * up[i];
-    }
-    if (!finite_array(activated.data(), activated.size())) return LM_ERR_RANGE;
-    status = profile_matvec(model, layer.ffn_down, &config->matvec, packed_scratch, packed_scratch_bytes,
-                            config->hidden_size, config->intermediate_size, activated.data(), down.data());
-    if (status != LM_OK) return status;
-    for (uint32_t i = 0u; i < config->hidden_size; ++i) attended[i] += down[i];
-    mean_square = 0.0f;
-    for (uint32_t i = 0u; i < config->hidden_size; ++i) mean_square += attended[i] * attended[i];
+    for (uint32_t i = 0u; i < config->hidden_size; ++i) mean_square += mlp_output[i] * mlp_output[i];
     mean_square /= static_cast<float>(config->hidden_size);
     const float output_scale = 1.0f / std::sqrt(mean_square + config->rms_epsilon);
     if (!std::isfinite(output_scale)) return LM_ERR_RANGE;
-    for (uint32_t i = 0u; i < config->hidden_size; ++i) normed[i] = attended[i] * output_scale * output_norm[i];
+    for (uint32_t i = 0u; i < config->hidden_size; ++i) normed[i] = mlp_output[i] * output_scale * output_norm[i];
     if (!finite_array(normed.data(), normed.size())) return LM_ERR_RANGE;
     status = profile_matvec(model, graph->output, &config->matvec, packed_scratch, packed_scratch_bytes,
                             config->vocab_size, config->hidden_size, normed.data(), out_logits);
     if (status != LM_OK) return status;
     return finite_array(out_logits, config->vocab_size) ? LM_OK : LM_ERR_RANGE;
+}
+
+lm_status lm_model_execute_native_transformer(const lm_model_file *model,
+                                              const lm_decoder_graph_binding *graph,
+                                              const lm_native_transformer_config *config,
+                                              uint32_t token_id,
+                                              lm_kv_cache *const *layer_caches,
+                                              uint32_t cache_count,
+                                              uint32_t page_id,
+                                              void *packed_scratch,
+                                              uint64_t packed_scratch_bytes,
+                                              float *out_logits,
+                                              size_t logits_count) {
+    if (!model || !graph || !config || !layer_caches || !packed_scratch || !out_logits ||
+        graph->layer_count == 0u || graph->layer_count > LM_DECODER_PLAN_MAX_LAYERS ||
+        cache_count != graph->layer_count || config->step.layer_index != 0u ||
+        config->step.vocab_size == 0u || config->step.hidden_size == 0u ||
+        config->step.intermediate_size == 0u || token_id >= config->step.vocab_size ||
+        logits_count < config->step.vocab_size || config->step.vocab_size > kNativeProfileMaxVocab ||
+        config->step.hidden_size > kNativeProfileMaxHidden ||
+        config->step.intermediate_size > kNativeProfileMaxIntermediate ||
+        !(config->step.rms_epsilon > 0.0f) || !std::isfinite(config->step.rms_epsilon) ||
+        (config->step.matrix_format != LM_QUANT_GGML_Q8_0 &&
+         config->step.matrix_format != LM_QUANT_GGML_Q4_K))
+        return LM_ERR_ARGUMENT;
+    for (uint32_t layer = 0u; layer < graph->layer_count; ++layer)
+        if (!layer_caches[layer]) return LM_ERR_ARGUMENT;
+    uint64_t payload = 0u;
+    lm_status status = profile_matrix(model, graph->token_embedding, config->step.hidden_size,
+                                      config->step.vocab_size, config->step.matrix_format, &payload);
+    if (status != LM_OK) return status;
+    status = profile_matrix(model, graph->output, config->step.vocab_size,
+                            config->step.hidden_size, config->step.matrix_format, &payload);
+    if (status != LM_OK) return status;
+    std::vector<float> one_hot, hidden, next, attended, normed, output_norm;
+    try {
+        one_hot.assign(config->step.vocab_size, 0.0f);
+        one_hot[token_id] = 1.0f;
+        hidden.assign(config->step.hidden_size, 0.0f);
+        next.assign(config->step.hidden_size, 0.0f);
+        attended.assign(config->step.hidden_size, 0.0f);
+        normed.assign(config->step.hidden_size, 0.0f);
+    } catch (const std::bad_alloc &) {
+        return LM_ERR_CAPACITY;
+    }
+    status = profile_matvec(model, graph->token_embedding, &config->step.matvec,
+                            packed_scratch, packed_scratch_bytes, config->step.hidden_size,
+                            config->step.vocab_size, one_hot.data(), hidden.data());
+    if (status != LM_OK) return status;
+    for (uint32_t layer_index = 0u; layer_index < graph->layer_count; ++layer_index) {
+        lm_native_attention_config attention{};
+        attention.matvec = config->step.matvec;
+        attention.layer_index = layer_index;
+        attention.hidden_size = config->step.hidden_size;
+        attention.token_offset = config->step.token_offset;
+        attention.use_rope = config->step.use_rope;
+        attention.rope_theta = config->step.rope_theta;
+        attention.rms_epsilon = config->step.rms_epsilon;
+        attention.matrix_format = config->step.matrix_format;
+        status = lm_model_execute_native_attention(model, graph, &attention, hidden.data(),
+                                                   layer_caches[layer_index], page_id,
+                                                   packed_scratch, packed_scratch_bytes,
+                                                   attended.data());
+        if (status != LM_OK) return status;
+        lm_native_mlp_config mlp{};
+        mlp.matvec = config->step.matvec;
+        mlp.layer_index = layer_index;
+        mlp.vocab_size = config->step.vocab_size;
+        mlp.hidden_size = config->step.hidden_size;
+        mlp.intermediate_size = config->step.intermediate_size;
+        mlp.matrix_format = config->step.matrix_format;
+        mlp.rms_epsilon = config->step.rms_epsilon;
+        status = profile_mlp_hidden(model, graph, &mlp, attended.data(), packed_scratch,
+                                    packed_scratch_bytes, next.data());
+        if (status != LM_OK) return status;
+        hidden.swap(next);
+    }
+    status = profile_vector(model, graph->output_norm, config->step.hidden_size, &output_norm);
+    if (status != LM_OK) return status;
+    float mean_square = 0.0f;
+    for (uint32_t i = 0u; i < config->step.hidden_size; ++i) mean_square += hidden[i] * hidden[i];
+    mean_square /= static_cast<float>(config->step.hidden_size);
+    const float output_scale = 1.0f / std::sqrt(mean_square + config->step.rms_epsilon);
+    if (!std::isfinite(output_scale)) return LM_ERR_RANGE;
+    for (uint32_t i = 0u; i < config->step.hidden_size; ++i) normed[i] = hidden[i] * output_scale * output_norm[i];
+    if (!finite_array(normed.data(), normed.size())) return LM_ERR_RANGE;
+    status = profile_matvec(model, graph->output, &config->step.matvec, packed_scratch,
+                            packed_scratch_bytes, config->step.vocab_size,
+                            config->step.hidden_size, normed.data(), out_logits);
+    if (status != LM_OK) return status;
+    return finite_array(out_logits, config->step.vocab_size) ? LM_OK : LM_ERR_RANGE;
 }
 
 lm_status lm_model_generate_native(const lm_model_file *model,
@@ -509,50 +630,75 @@ lm_status lm_model_generate_native(const lm_model_file *model,
         if (prompt_tokens[i] >= config->step.vocab_size) return LM_ERR_RANGE;
     const uint32_t context_tokens = static_cast<uint32_t>(prompt_count) + config->max_new_tokens;
     const uint32_t kv_bytes = config->step.hidden_size * static_cast<uint32_t>(sizeof(float));
-    lm_kv_cache *kv_cache = nullptr;
-    lm_status status = lm_kv_cache_create_with_payload(1u, context_tokens, kv_bytes, kv_bytes, &kv_cache);
-    if (status != LM_OK) return status;
-    uint32_t page_id = UINT32_MAX;
+    std::vector<lm_kv_cache *> layer_caches;
+    std::vector<uint8_t> page_live;
     std::vector<float> logits;
     try {
+        layer_caches.assign(graph->layer_count, nullptr);
+        page_live.assign(graph->layer_count, 0u);
         logits.assign(config->step.vocab_size, 0.0f);
     } catch (const std::bad_alloc &) {
-        lm_kv_cache_destroy(kv_cache);
         return LM_ERR_CAPACITY;
     }
-    lm_native_step_config step = config->step;
-    for (size_t i = 0u; i < prompt_count; ++i) {
-        status = lm_kv_cache_append(kv_cache, &page_id, 1u);
-        if (status != LM_OK) break;
-        step.token_offset = static_cast<uint32_t>(i);
-        status = lm_model_execute_native_step(model, graph, &step, prompt_tokens[i], kv_cache,
-                                              page_id, packed_scratch, packed_scratch_bytes,
-                                              logits.data(), logits.size());
+    auto cleanup = [&]() {
+        for (uint32_t layer = 0u; layer < graph->layer_count; ++layer) {
+            if (!layer_caches[layer]) continue;
+            if (page_live[layer] != 0u) (void)lm_kv_cache_release(layer_caches[layer], 0u);
+            lm_kv_cache_destroy(layer_caches[layer]);
+        }
+    };
+    lm_status status = LM_OK;
+    for (uint32_t layer = 0u; layer < graph->layer_count; ++layer) {
+        status = lm_kv_cache_create_with_payload(1u, context_tokens, kv_bytes, kv_bytes,
+                                                 &layer_caches[layer]);
         if (status != LM_OK) break;
     }
-    *out_count = 0u;
     if (status == LM_OK) {
-        for (uint32_t i = 0u; i < config->max_new_tokens; ++i) {
+        lm_native_transformer_config transformer{};
+        transformer.step = config->step;
+        for (size_t i = 0u; i < prompt_count; ++i) {
+            for (uint32_t layer = 0u; layer < graph->layer_count; ++layer) {
+                uint32_t page_id = page_live[layer] == 0u ? UINT32_MAX : 0u;
+                status = lm_kv_cache_append(layer_caches[layer], &page_id, 1u);
+                if (status != LM_OK || page_id != 0u) break;
+                page_live[layer] = 1u;
+            }
+            if (status != LM_OK) break;
+            transformer.step.token_offset = static_cast<uint32_t>(i);
+            status = lm_model_execute_native_transformer(model, graph, &transformer,
+                                                         prompt_tokens[i], layer_caches.data(),
+                                                         static_cast<uint32_t>(layer_caches.size()), 0u,
+                                                         packed_scratch, packed_scratch_bytes,
+                                                         logits.data(), logits.size());
+            if (status != LM_OK) break;
+        }
+        *out_count = 0u;
+        for (uint32_t i = 0u; status == LM_OK && i < config->max_new_tokens; ++i) {
             float probability = 0.0f;
             uint32_t next_token = 0u;
             status = lm_sample_logits(logits.data(), config->step.vocab_size, &config->sampling,
-                                       &next_token, &probability);
+                                      &next_token, &probability);
             if (status != LM_OK) break;
             out_tokens[*out_count] = next_token;
             ++*out_count;
             if (config->has_stop_token && next_token == config->stop_token) break;
             if (i + 1u == config->max_new_tokens) break;
-            status = lm_kv_cache_append(kv_cache, &page_id, 1u);
+            for (uint32_t layer = 0u; layer < graph->layer_count; ++layer) {
+                uint32_t page_id = page_live[layer] == 0u ? UINT32_MAX : 0u;
+                status = lm_kv_cache_append(layer_caches[layer], &page_id, 1u);
+                if (status != LM_OK || page_id != 0u) break;
+                page_live[layer] = 1u;
+            }
             if (status != LM_OK) break;
-            step.token_offset = static_cast<uint32_t>(prompt_count) + i;
-            status = lm_model_execute_native_step(model, graph, &step, next_token, kv_cache,
-                                                  page_id, packed_scratch, packed_scratch_bytes,
-                                                  logits.data(), logits.size());
-            if (status != LM_OK) break;
+            transformer.step.token_offset = static_cast<uint32_t>(prompt_count) + i;
+            status = lm_model_execute_native_transformer(model, graph, &transformer, next_token,
+                                                         layer_caches.data(),
+                                                         static_cast<uint32_t>(layer_caches.size()), 0u,
+                                                         packed_scratch, packed_scratch_bytes,
+                                                         logits.data(), logits.size());
         }
     }
-    lm_kv_cache_release(kv_cache, page_id);
-    lm_kv_cache_destroy(kv_cache);
+    cleanup();
     return status;
 }
 

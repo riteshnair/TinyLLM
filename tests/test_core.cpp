@@ -416,6 +416,15 @@ static void test_native_mlp_profile() {
     add("blk.0.ffn_gate.weight", 8u, 2u, intermediate, hidden, static_cast<uint64_t>(intermediate) * 34u);
     add("blk.0.ffn_down.weight", 8u, 2u, hidden, intermediate, static_cast<uint64_t>(hidden) * 68u);
     add("blk.0.ffn_up.weight", 8u, 2u, intermediate, hidden, static_cast<uint64_t>(intermediate) * 34u);
+    add("blk.1.attn_norm.weight", LM_DTYPE_F32, 1u, hidden, 0u, hidden * sizeof(float));
+    add("blk.1.attn_q.weight", 8u, 2u, hidden, hidden, static_cast<uint64_t>(hidden) * 34u);
+    add("blk.1.attn_k.weight", 8u, 2u, hidden, hidden, static_cast<uint64_t>(hidden) * 34u);
+    add("blk.1.attn_v.weight", 8u, 2u, hidden, hidden, static_cast<uint64_t>(hidden) * 34u);
+    add("blk.1.attn_output.weight", 8u, 2u, hidden, hidden, static_cast<uint64_t>(hidden) * 34u);
+    add("blk.1.ffn_norm.weight", LM_DTYPE_F32, 1u, hidden, 0u, hidden * sizeof(float));
+    add("blk.1.ffn_gate.weight", 8u, 2u, intermediate, hidden, static_cast<uint64_t>(intermediate) * 34u);
+    add("blk.1.ffn_down.weight", 8u, 2u, hidden, intermediate, static_cast<uint64_t>(hidden) * 68u);
+    add("blk.1.ffn_up.weight", 8u, 2u, intermediate, hidden, static_cast<uint64_t>(intermediate) * 34u);
 
     std::vector<unsigned char> gguf(24u, 0u);
     gguf[0] = 'G'; gguf[1] = 'G'; gguf[2] = 'U'; gguf[3] = 'F';
@@ -461,6 +470,13 @@ static void test_native_mlp_profile() {
     fill_q8(specs[5].offset, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
     fill_q8(specs[6].offset, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
     fill_q8(specs[7].offset, hidden, [](uint32_t row) { return row == 0u ? static_cast<unsigned char>(1u) : static_cast<unsigned char>(0u); });
+    fill_q8(specs[13].offset, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
+    fill_q8(specs[14].offset, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
+    fill_q8(specs[15].offset, hidden, [](uint32_t) { return static_cast<unsigned char>(1u); });
+    fill_q8(specs[16].offset, hidden, [](uint32_t row) { return row == 0u ? static_cast<unsigned char>(1u) : static_cast<unsigned char>(0u); });
+    fill_q8(specs[18].offset, intermediate, [](uint32_t) { return static_cast<unsigned char>(1u); });
+    fill_q8(specs[19].offset, hidden, [](uint32_t) { return static_cast<unsigned char>(0u); });
+    fill_q8(specs[20].offset, intermediate, [](uint32_t) { return static_cast<unsigned char>(1u); });
     fill_q8(specs[9].offset, intermediate, [](uint32_t) { return static_cast<unsigned char>(1u); });
     fill_q8(specs[10].offset, hidden, [](uint32_t) { return static_cast<unsigned char>(0u); });
     fill_q8(specs[11].offset, intermediate, [](uint32_t) { return static_cast<unsigned char>(1u); });
@@ -469,6 +485,8 @@ static void test_native_mlp_profile() {
         std::memcpy(payload(specs[2].offset) + i * sizeof(float), &one, sizeof(one));
         std::memcpy(payload(specs[3].offset) + i * sizeof(float), &one, sizeof(one));
         std::memcpy(payload(specs[8].offset) + i * sizeof(float), &one, sizeof(one));
+        std::memcpy(payload(specs[12].offset) + i * sizeof(float), &one, sizeof(one));
+        std::memcpy(payload(specs[17].offset) + i * sizeof(float), &one, sizeof(one));
     }
     const char *path = "test-native-mlp.gguf";
     {
@@ -480,6 +498,7 @@ static void test_native_mlp_profile() {
     assert(lm_model_open(path, &model, error, sizeof(error)) == LM_OK);
     lm_decoder_graph_binding graph{};
     assert(lm_model_build_llama_graph(model, &graph) == LM_OK);
+    assert(graph.layer_count == 2u);
     lm_native_mlp_config config{};
     config.matvec = {LM_BACKEND_CPU, 0u, nullptr};
     config.layer_index = 0u;

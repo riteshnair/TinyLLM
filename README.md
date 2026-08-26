@@ -6,7 +6,7 @@ TinyLLM is a compact, Vulkan-first modular LLM inference engine with a strict C9
 
 The repository currently provides bounded GGUF/SafeTensors inspection, exact native GGML Q4_0/Q8_0/Q4_K storage contracts, lazy file-span bindings, replaceable Vulkan packed dot and matvec shaders, paged KV metadata plus bounded opaque payloads with copy-on-write, exact bounded GGUF vocabulary parsing, deterministic sampling, and a narrow native single-layer path.
 
-The narrow path can validate a one-layer, one-head, equal-Q/KV-width profile; execute native Q8_0 MLP and attention operations; use an explicit F32 KV payload; produce logits; encode a bounded prompt; and run a bounded deterministic generation loop. It is exposed through the library API and the CLI’s `--generate` entrypoint. This is a real tested vertical slice, not arbitrary-checkpoint compatibility.
+The narrow path can validate a multi-layer, one-head, equal-Q/KV-width profile when every layer satisfies the same explicit shape and native-format contract; execute native Q8_0 MLP and attention operations; use an explicit F32 KV payload per layer; produce logits; encode a bounded prompt; and run a bounded deterministic generation loop. It is exposed through the library API and the CLI’s `--generate` entrypoint. This is a real tested vertical slice, not arbitrary-checkpoint compatibility.
 
 The engine deliberately returns named unsupported errors for capabilities outside the validated profile. Full multi-layer architecture metadata, broad tokenizer semantics, GQA variants, quantized KV policy, model residency scheduling, batching, streaming, server/WebUI integration, distributed execution, and future ROCr/HSA backends remain pending.
 
@@ -40,7 +40,7 @@ For the validated narrow profile, use:
   --generate --prompt "ab" --max-new-tokens 8
 ```
 
-The CLI accepts only models that satisfy the narrow profile’s exact tensor names, shapes, native matrix types, and GGUF vocabulary contract.
+The CLI currently accepts only the narrow validated GGUF profile and its exact tensor names, shapes, native matrix types, and GGUF vocabulary contract; the library API supports the validated multi-layer same-shape path.
 
 ## Source layout
 
