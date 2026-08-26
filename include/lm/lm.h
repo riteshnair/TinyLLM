@@ -428,7 +428,7 @@ lm_status lm_model_tensor_matvec_native(const lm_model_file *model, uint64_t ten
                                         void *packed_scratch, uint64_t scratch_bytes,
                                         uint32_t rows, uint32_t columns,
                                         const float *input, float *out);
-/* Reads one exact F32 matrix into caller scratch; no dtype conversion or model-wide expansion occurs. */
+/* Reads one exact SafeTensors F32, F16, or BF16 matrix into caller scratch; conversion is limited to this matrix and no model-wide expansion occurs. Vulkan remains F32-only for this API. */
 lm_status lm_model_tensor_matvec_f32_cpu(const lm_model_file *model, uint64_t tensor_index,
                                          void *matrix_scratch, uint64_t scratch_bytes,
                                          uint32_t rows, uint32_t columns,
@@ -755,6 +755,9 @@ typedef struct lm_native_generation_config {
     lm_context_policy context_policy;
     uint32_t context_window;
     uint32_t context_keep_prefix;
+    /* When set, generation allocates typed KV pages with this CPU codec; otherwise it preserves opaque F32 payload compatibility. */
+    lm_kv_dtype kv_dtype;
+    uint8_t use_typed_kv;
 } lm_native_generation_config;
 
 typedef lm_status (*lm_native_token_callback)(void *user, uint32_t token_id, float probability);
@@ -850,8 +853,12 @@ lm_status lm_kv_cache_rollback(lm_kv_cache *cache, uint32_t page_id,
 lm_status lm_kv_cache_release(lm_kv_cache *cache, uint32_t page_id);
 lm_status lm_kv_cache_get_stats(const lm_kv_cache *cache, lm_kv_stats *out_stats);
 lm_status lm_kv_cache_get_payload_layout(const lm_kv_cache *cache,
-                                         uint32_t *key_bytes_per_token,
-                                         uint32_t *value_bytes_per_token);
+                                          uint32_t *key_bytes_per_token,
+                                          uint32_t *value_bytes_per_token);
+/* Returns the explicit codec and decoded element counts; opaque payload caches return LM_ERR_UNSUPPORTED. */
+lm_status lm_kv_cache_get_codec(const lm_kv_cache *cache, lm_kv_dtype *dtype,
+                                uint32_t *key_elements_per_token,
+                                uint32_t *value_elements_per_token);
 /* Read/write cover already-appended tokens only; writes detach shared pages first. */
 lm_status lm_kv_cache_write_payload(lm_kv_cache *cache, uint32_t page_id,
                                      uint32_t token_offset, uint32_t token_count,

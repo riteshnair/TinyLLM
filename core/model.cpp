@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+float half_to_float(uint16_t bits);
+
 struct lm_model_file {
     lm_file *file;
     lm_file_shard_set *shards;
@@ -1235,19 +1237,39 @@ lm_status lm_model_tensor_matvec_f32_cpu(const lm_model_file *model, uint64_t te
     if (static_cast<uint64_t>(rows) > UINT64_MAX / columns) return LM_ERR_CAPACITY;
     const uint64_t elements = static_cast<uint64_t>(rows) * columns;
     if (elements > UINT64_MAX / sizeof(float)) return LM_ERR_CAPACITY;
-    const uint64_t bytes = elements * sizeof(float);
-    if (bytes > scratch_bytes || bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+    const uint64_t scratch_bytes_needed = elements * sizeof(float);
+    if (scratch_bytes_needed > scratch_bytes || scratch_bytes_needed > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
         return LM_ERR_CAPACITY;
     lm_model_tensor_info descriptor{};
     lm_status status = lm_model_tensor_info_at(model, tensor_index, &descriptor);
     if (status != LM_OK) return status;
-    if (descriptor.rank != 2u || descriptor.type != LM_DTYPE_F32 || descriptor.dims[0] != rows ||
-        descriptor.dims[1] != columns) return LM_ERR_UNSUPPORTED;
+    if (descriptor.rank != 2u || descriptor.dims[0] != rows || descriptor.dims[1] != columns)
+        return LM_ERR_UNSUPPORTED;
+    const bool scalar16 = descriptor.type == LM_DTYPE_F16 || descriptor.type == LM_DTYPE_BF16;
+    if (descriptor.type != LM_DTYPE_F32 || scalar16) {
+        if (model->info.format != LM_MODEL_SAFETENSORS || !scalar16) return LM_ERR_UNSUPPORTED;
+    }
+    const uint64_t source_element_bytes = descriptor.type == LM_DTYPE_F32 ? sizeof(float) : sizeof(uint16_t);
+    if (elements > UINT64_MAX / source_element_bytes) return LM_ERR_CAPACITY;
+    const uint64_t source_bytes = elements * source_element_bytes;
     lm_file_span span{};
-    status = lm_model_tensor_span_at(model, tensor_index, bytes, &span);
+    status = lm_model_tensor_span_at(model, tensor_index, source_bytes, &span);
     if (status != LM_OK) return status;
-    status = lm_file_span_read(&span, 0u, matrix_scratch, static_cast<size_t>(bytes));
+    status = lm_file_span_read(&span, 0u, matrix_scratch, static_cast<size_t>(source_bytes));
     if (status != LM_OK) return status;
+    if (descriptor.type == LM_DTYPE_F16 || descriptor.type == LM_DTYPE_BF16) {
+        unsigned char *storage = static_cast<unsigned char *>(matrix_scratch);
+        for (uint64_t i = elements; i != 0u; --i) {
+            uint16_t bits = 0u;
+            std::memcpy(&bits, storage + static_cast<size_t>(i - 1u) * sizeof(bits), sizeof(bits));
+            uint32_t value = descriptor.type == LM_DTYPE_F16 ? 0u : static_cast<uint32_t>(bits) << 16u;
+            if (descriptor.type == LM_DTYPE_F16) {
+                const float converted = half_to_float(bits);
+                std::memcpy(&value, &converted, sizeof(value));
+            }
+            std::memcpy(storage + static_cast<size_t>(i - 1u) * sizeof(float), &value, sizeof(value));
+        }
+    }
     const float *matrix = static_cast<const float *>(matrix_scratch);
     for (uint32_t row = 0u; row < rows; ++row) {
         float sum = 0.0f;

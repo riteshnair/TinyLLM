@@ -75,9 +75,16 @@ static lm_status open_cli_model(const char *path, lm_model_file **out_model, cha
     return lm_model_open_sharded(path_ptrs.data(), path_ptrs.size(), out_model, error, error_capacity);
 }
 
+struct http_stream_state {
+    int socket_fd;
+    const lm_model_file *model;
+};
+
 static lm_status run_native_generation(const lm_config &config, const char *prompt,
                                        uint32_t max_new_tokens, char *result,
-                                       size_t result_capacity, size_t *result_bytes) {
+                                       size_t result_capacity, size_t *result_bytes,
+                                       lm_native_token_callback callback = nullptr,
+                                       void *callback_user = nullptr) {
     if (!config.model_path[0] || !prompt || max_new_tokens == 0u ||
         (result == nullptr) != (result_bytes == nullptr)) return LM_ERR_ARGUMENT;
     lm_model_file *model = nullptr;
@@ -87,7 +94,12 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
         std::fprintf(stderr, "model open failed: %s (%s)\\n", lm_status_name(status), error);
         return status;
     }
+    if (callback && callback_user) static_cast<http_stream_state *>(callback_user)->model = model;
     lm_decoder_graph_binding graph{};
+    lm_model_info model_info{};
+    status = lm_model_get_info(model, &model_info);
+    if (status != LM_OK) { lm_model_close(model); return status; }
+    const bool safetensors = model_info.format == LM_MODEL_SAFETENSORS;
     status = lm_model_build_llama_graph(model, &graph);
     if (status != LM_OK || graph.layer_count == 0u || graph.layer_count > LM_DECODER_PLAN_MAX_LAYERS) {
         lm_model_close(model);
@@ -116,12 +128,30 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
     if (embedding.rank != 2u || output.rank != 2u || embedding.dims[1] != output.dims[0] ||
         embedding.dims[0] != output.dims[1] || embedding.dims[0] != architecture.embedding_length ||
         output_norm.rank != 1u || output_norm.dims[0] != embedding.dims[0] ||
-        (embedding.type != 8u && embedding.type != 12u) || output.type != embedding.type ||
-        output_norm.type != LM_DTYPE_F32) {
+        output.type != embedding.type ||
+        (!safetensors && output_norm.type != LM_DTYPE_F32) ||
+        (safetensors && output_norm.type != LM_DTYPE_F32 && output_norm.type != LM_DTYPE_F16 && output_norm.type != LM_DTYPE_BF16)) {
         lm_model_close(model);
         return LM_ERR_UNSUPPORTED;
     }
     const uint32_t matrix_type = embedding.type;
+    const bool scalar16 = safetensors && (matrix_type == LM_DTYPE_F16 || matrix_type == LM_DTYPE_BF16);
+    const bool scalar32 = safetensors && matrix_type == LM_DTYPE_F32;
+    const bool packed = !safetensors && (matrix_type == 8u || matrix_type == 12u);
+    if (!scalar16 && !scalar32 && !packed) {
+        lm_model_close(model);
+        return LM_ERR_UNSUPPORTED;
+    }
+    lm_backend_kind execution_backend = config.backend;
+    if (execution_backend == LM_BACKEND_AUTO) {
+        uint32_t device_count = 0u;
+        execution_backend = (!scalar16 && lm_vulkan_device_count(&device_count) == LM_OK && device_count != 0u) ?
+                            LM_BACKEND_VULKAN : LM_BACKEND_CPU;
+    }
+    if (scalar16 && execution_backend != LM_BACKEND_CPU) {
+        lm_model_close(model);
+        return LM_ERR_UNSUPPORTED;
+    }
     std::vector<uint64_t> indices;
     try {
         indices.reserve(2u + static_cast<size_t>(graph.layer_count) * 7u);
@@ -135,7 +165,8 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
             for (uint32_t i = 0u; i < 7u; ++i) {
                 status = descriptor(layer_indices[i], &layer_infos[i]);
                 if (status != LM_OK) { lm_model_close(model); return status; }
-                if (layer_infos[i].type != matrix_type || layer_infos[i].rank != 2u) {
+                if (layer_infos[i].type != matrix_type || layer_infos[i].rank != 2u ||
+                (safetensors && layer_infos[i].type != LM_DTYPE_F32 && layer_infos[i].type != LM_DTYPE_F16 && layer_infos[i].type != LM_DTYPE_BF16)) {
                     lm_model_close(model); return LM_ERR_UNSUPPORTED;
                 }
             }
@@ -156,13 +187,15 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
             lm_model_tensor_info attn_norm{};
             lm_model_tensor_info ffn_norm{};
             status = descriptor(layer.attn_norm, &attn_norm);
-            if (status != LM_OK || attn_norm.type != LM_DTYPE_F32 || attn_norm.rank != 1u ||
-                attn_norm.dims[0] != embedding.dims[0]) {
+            if (status != LM_OK || attn_norm.rank != 1u || attn_norm.dims[0] != embedding.dims[0] ||
+                ((!safetensors && attn_norm.type != LM_DTYPE_F32) ||
+                 (safetensors && attn_norm.type != LM_DTYPE_F32 && attn_norm.type != LM_DTYPE_F16 && attn_norm.type != LM_DTYPE_BF16))) {
                 lm_model_close(model); return status != LM_OK ? status : LM_ERR_UNSUPPORTED;
             }
             status = descriptor(layer.ffn_norm, &ffn_norm);
-            if (status != LM_OK || ffn_norm.type != LM_DTYPE_F32 || ffn_norm.rank != 1u ||
-                ffn_norm.dims[0] != embedding.dims[0]) {
+            if (status != LM_OK || ffn_norm.rank != 1u || ffn_norm.dims[0] != embedding.dims[0] ||
+                ((!safetensors && ffn_norm.type != LM_DTYPE_F32) ||
+                 (safetensors && ffn_norm.type != LM_DTYPE_F32 && ffn_norm.type != LM_DTYPE_F16 && ffn_norm.type != LM_DTYPE_BF16))) {
                 lm_model_close(model); return status != LM_OK ? status : LM_ERR_UNSUPPORTED;
             }
             for (uint32_t i = 0u; i < 7u; ++i) indices.push_back(layer_indices[i]);
@@ -179,10 +212,22 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
     }
     uint64_t max_scratch = 0u;
     for (const uint64_t index : indices) {
-        lm_model_tensor_binding binding{};
-        status = lm_model_tensor_bind_native(model, index, &binding);
+        lm_model_tensor_info tensor{};
+        status = descriptor(index, &tensor);
         if (status != LM_OK) { lm_model_close(model); return status; }
-        if (binding.span.bytes > max_scratch) max_scratch = binding.span.bytes;
+        if (safetensors) {
+            if (tensor.rank != 2u || tensor.dims[0] > UINT64_MAX / tensor.dims[1] ||
+                tensor.dims[0] * tensor.dims[1] > UINT64_MAX / sizeof(float)) {
+                lm_model_close(model); return LM_ERR_CAPACITY;
+            }
+            const uint64_t bytes = tensor.dims[0] * tensor.dims[1] * sizeof(float);
+            if (bytes > max_scratch) max_scratch = bytes;
+        } else {
+            lm_model_tensor_binding binding{};
+            status = lm_model_tensor_bind_native(model, index, &binding);
+            if (status != LM_OK) { lm_model_close(model); return status; }
+            if (binding.span.bytes > max_scratch) max_scratch = binding.span.bytes;
+        }
     }
     if (max_scratch == 0u || max_scratch > (64ull << 20u)) {
         lm_model_close(model);
@@ -197,9 +242,10 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
         lm_model_close(model);
         return LM_ERR_CAPACITY;
     }
-    const char *shader = matrix_type == 8u ? "matvec_q8_0_f32.comp.spv" : "matvec_q4_k_f32.comp.spv";
+    const char *shader = safetensors ? "matvec_f32.comp.spv" :
+                         (matrix_type == 8u ? "matvec_q8_0_f32.comp.spv" : "matvec_q4_k_f32.comp.spv");
     lm_native_generation_config generation{};
-    generation.step.matvec = {config.backend, config.device_index, shader, nullptr};
+    generation.step.matvec = {execution_backend, config.device_index, shader, nullptr};
     generation.step.layer_index = 0u;
     generation.step.vocab_size = token_count;
     generation.step.hidden_size = static_cast<uint32_t>(embedding.dims[0]);
@@ -208,13 +254,35 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
     generation.step.head_count_kv = architecture.head_count_kv;
     generation.step.use_rope = 0u;
     generation.step.rms_epsilon = 1.0e-5f;
-    generation.step.matrix_format = matrix_type == 8u ? LM_QUANT_GGML_Q8_0 : LM_QUANT_GGML_Q4_K;
+    generation.step.matrix_format = safetensors ? LM_QUANT_NONE :
+                                    (matrix_type == 8u ? LM_QUANT_GGML_Q8_0 : LM_QUANT_GGML_Q4_K);
+    generation.kv_dtype = config.kv_dtype;
+    generation.use_typed_kv = execution_backend == LM_BACKEND_CPU ? 1u : 0u;
     generation.sampling = {LM_SAMPLING_GREEDY, 0u, 1.0f, 1u};
     generation.max_new_tokens = max_new_tokens;
     size_t generated_bytes = 0u;
-    status = lm_model_generate_native_text(model, &graph, &generation, prompt, std::strlen(prompt),
-                                           scratch.data(), scratch.size(), generated.data(), generated.size(),
-                                           &generated_bytes);
+    if (callback) {
+        if (result || result_bytes) { lm_model_close(model); return LM_ERR_ARGUMENT; }
+        std::vector<uint32_t> prompt_tokens;
+        try {
+            prompt_tokens.resize(std::strlen(prompt) + 1u, 0u);
+        } catch (...) {
+            lm_model_close(model);
+            return LM_ERR_CAPACITY;
+        }
+        size_t prompt_count = 0u;
+        status = lm_model_token_encode(model, prompt, std::strlen(prompt), prompt_tokens.data(),
+                                       prompt_tokens.size(), &prompt_count);
+        if (status == LM_OK)
+            status = lm_model_generate_native_stream(model, &graph, &generation,
+                                                     prompt_tokens.data(), prompt_count,
+                                                     scratch.data(), scratch.size(), callback,
+                                                     callback_user);
+    } else {
+        status = lm_model_generate_native_text(model, &graph, &generation, prompt, std::strlen(prompt),
+                                               scratch.data(), scratch.size(), generated.data(), generated.size(),
+                                               &generated_bytes);
+    }
     if (status == LM_OK) {
         if (result) {
             if (generated_bytes > result_capacity) status = LM_ERR_CAPACITY;
@@ -259,6 +327,59 @@ static bool json_string_field(const char *body, const char *key, std::string *ou
         }
     }
     return false;
+}
+
+static bool json_chat_messages_field(const char *body, std::string *out) {
+    if (!body || !out) return false;
+    const char *at = std::strstr(body, "\"messages\"");
+    if (!at) return false;
+    at += 10u;
+    while (*at && std::isspace(static_cast<unsigned char>(*at))) ++at;
+    if (*at++ != ':') return false;
+    while (*at && std::isspace(static_cast<unsigned char>(*at))) ++at;
+    if (*at++ != '[') return false;
+    out->clear();
+    bool found = false;
+    for (;;) {
+        while (*at && std::isspace(static_cast<unsigned char>(*at))) ++at;
+        if (*at == ']') return found;
+        if (*at++ != '{') return false;
+        const char *object = at - 1;
+        const char *cursor = at;
+        unsigned depth = 1u;
+        bool quoted = false;
+        bool escaped = false;
+        while (*cursor && depth != 0u) {
+            const char c = *cursor++;
+            if (quoted) {
+                if (escaped) escaped = false;
+                else if (c == '\\') escaped = true;
+                else if (c == '"') quoted = false;
+            } else if (c == '"') quoted = true;
+            else if (c == '{') ++depth;
+            else if (c == '}') --depth;
+        }
+        if (quoted || depth != 0u) return false;
+        const size_t object_bytes = static_cast<size_t>(cursor - object);
+        if (object_bytes > (1u << 16u)) return false;
+        std::string object_text(object, object_bytes);
+        std::string role;
+        std::string content;
+        if (!json_string_field(object_text.c_str(), "role", &role) ||
+            !json_string_field(object_text.c_str(), "content", &content) ||
+            (role != "system" && role != "user" && role != "assistant")) return false;
+        if (out->size() + role.size() + content.size() + 3u > (1u << 16u)) return false;
+        if (found) out->push_back('\n');
+        out->append(role);
+        out->append(": ");
+        out->append(content);
+        found = true;
+        at = cursor;
+        while (*at && std::isspace(static_cast<unsigned char>(*at))) ++at;
+        if (*at == ',') { ++at; continue; }
+        if (*at == ']') return found;
+        return false;
+    }
 }
 
 static bool json_u32_field(const char *body, const char *key, uint32_t *out) {
@@ -328,6 +449,26 @@ static void send_http(int socket_fd, int status, const char *content_type, const
     if (length > 0) { send_all(socket_fd, header, static_cast<size_t>(length)); send_all(socket_fd, body.data(), body.size()); }
 }
 
+static lm_status http_stream_token(void *user, uint32_t token_id, float probability) {
+    (void)probability;
+    http_stream_state *state = static_cast<http_stream_state *>(user);
+    if (!state || !state->model) return LM_ERR_ARGUMENT;
+    size_t token_bytes = 0u;
+    lm_status status = lm_model_token_at(state->model, token_id, nullptr, 0u, &token_bytes);
+    if (status != LM_OK || token_bytes > (1u << 16u)) return status == LM_OK ? LM_ERR_CAPACITY : status;
+    std::vector<char> token;
+    try { token.assign(token_bytes + 1u, '\0'); }
+    catch (const std::bad_alloc &) { return LM_ERR_CAPACITY; }
+    status = lm_model_token_at(state->model, token_id, token.data(), token.size(), &token_bytes);
+    if (status != LM_OK) return status;
+    const std::string event = std::string(R"(data: {"choices":[{"text":")") +
+                              json_escape(token.data(), token_bytes) +
+                              R"(","index":0,"finish_reason":null}]}
+
+)";
+    return send_all(state->socket_fd, event.data(), event.size()) ? LM_OK : LM_ERR_IO;
+}
+
 static int run_http_server(const lm_config &config, uint32_t port) {
     const int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) return 4;
@@ -356,33 +497,53 @@ static int run_http_server(const lm_config &config, uint32_t port) {
             send_http(client, 200, "application/json", "{\"status\":\"ok\"}");
         } else if (std::strncmp(request, "POST /v1/completions ", 21u) == 0 ||
                    std::strncmp(request, "POST /v1/chat/completions ", 26u) == 0) {
+            const bool chat_request = std::strncmp(request, "POST /v1/chat/completions ", 26u) == 0;
             std::string prompt;
             uint32_t max_tokens = 8u;
             bool stream = false;
-            if (!json_string_field(body, "prompt", &prompt) ||
+            const bool prompt_valid = chat_request ? json_chat_messages_field(body, &prompt) :
+                                                      json_string_field(body, "prompt", &prompt);
+            if (!prompt_valid ||
                 (std::strstr(body, "\"max_tokens\"") && !json_u32_field(body, "max_tokens", &max_tokens)) ||
                 (std::strstr(body, "\"stream\"") && !json_bool_field(body, "stream", &stream)) ||
                 max_tokens == 0u || max_tokens > 64u) {
                 send_http(client, 400, "application/json", "{\"error\":\"invalid_request\"}");
             } else {
-                std::vector<char> generated(static_cast<size_t>(max_tokens) * 256u + 1u, '\0');
-                size_t generated_bytes = 0u;
-                const lm_status status = run_native_generation(config, prompt.c_str(), max_tokens,
-                                                               generated.data(), generated.size(), &generated_bytes);
-                if (status != LM_OK) {
-                    const std::string error = std::string("{\"error\":\"") + lm_status_name(status) + "\"}";
-                    send_http(client, status == LM_ERR_UNSUPPORTED ? 501 : 500, "application/json", error);
-                } else if (stream) {
-                    const std::string event = std::string("data: {\"choices\":[{\"text\":\"") +
-                                              json_escape(generated.data(), generated_bytes) +
-                                              "\"}]}\n\ndata: [DONE]\n\n";
+                if (stream) {
                     const std::string header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
-                    send_all(client, header.data(), header.size());
-                    send_all(client, event.data(), event.size());
+                    if (!send_all(client, header.data(), header.size())) {
+                        close(client);
+                        continue;
+                    }
+                    http_stream_state stream_state{client, nullptr};
+                    const lm_status status = run_native_generation(config, prompt.c_str(), max_tokens,
+                                                                   nullptr, 0u, nullptr,
+                                                                   http_stream_token, &stream_state);
+                    if (status == LM_OK) {
+                        static const char done[] = R"(data: [DONE]
+
+)";
+                        (void)send_all(client, done, sizeof(done) - 1u);
+                    } else {
+                        const std::string event = std::string(R"(data: {"error":")") +
+                                                  lm_status_name(status) + R"("}
+
+)";
+                        (void)send_all(client, event.data(), event.size());
+                    }
                 } else {
-                    const std::string response = std::string("{\"choices\":[{\"text\":\"") +
-                                                  json_escape(generated.data(), generated_bytes) + "\",\"finish_reason\":\"stop\"}]}";
-                    send_http(client, 200, "application/json", response);
+                    std::vector<char> generated(static_cast<size_t>(max_tokens) * 256u + 1u, '\0');
+                    size_t generated_bytes = 0u;
+                    const lm_status status = run_native_generation(config, prompt.c_str(), max_tokens,
+                                                                   generated.data(), generated.size(), &generated_bytes);
+                    if (status != LM_OK) {
+                        const std::string error = std::string("{\"error\":\"") + lm_status_name(status) + "\"}";
+                        send_http(client, status == LM_ERR_UNSUPPORTED ? 501 : 500, "application/json", error);
+                    } else {
+                        const std::string response = std::string("{\"choices\":[{\"text\":\"") +
+                                                      json_escape(generated.data(), generated_bytes) + "\",\"finish_reason\":\"stop\"}]}";
+                        send_http(client, 200, "application/json", response);
+                    }
                 }
             }
         } else {

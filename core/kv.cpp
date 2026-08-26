@@ -338,6 +338,17 @@ lm_status lm_kv_cache_get_payload_layout(const lm_kv_cache *cache,
     return LM_OK;
 }
 
+lm_status lm_kv_cache_get_codec(const lm_kv_cache *cache, lm_kv_dtype *dtype,
+                                uint32_t *key_elements_per_token,
+                                uint32_t *value_elements_per_token) {
+    if (!cache || !dtype || !key_elements_per_token || !value_elements_per_token) return LM_ERR_ARGUMENT;
+    if (!cache->typed) return LM_ERR_UNSUPPORTED;
+    *dtype = cache->dtype;
+    *key_elements_per_token = cache->key_elements_per_token;
+    *value_elements_per_token = cache->value_elements_per_token;
+    return LM_OK;
+}
+
 lm_status lm_kv_cache_write_payload(lm_kv_cache *cache, uint32_t page_id,
                                      uint32_t token_offset, uint32_t token_count,
                                      const void *keys, const void *values) {

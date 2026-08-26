@@ -621,6 +621,76 @@ static void test_model_bound_moe_q4_k() {
     std::remove(path);
 }
 
+static void test_safetensors_f16_bf16_matvec() {
+    const char *dtype_names[] = {"F16", "BF16"};
+    const uint16_t payloads[][4] = {
+        {0x3c00u, 0x4000u, 0x4200u, 0x4400u},
+        {0x3f80u, 0x4000u, 0x4040u, 0x4080u}
+    };
+    for (unsigned kind = 0u; kind < 2u; ++kind) {
+        const char *path = kind == 0u ? "test-f16.safetensors" : "test-bf16.safetensors";
+        char json[160] = {};
+        const int written = std::snprintf(json, sizeof(json), "{\"m\":{\"dtype\":\"%s\",\"shape\":[2,2],\"data_offsets\":[0,8]}}", dtype_names[kind]);
+        assert(written > 0 && static_cast<size_t>(written) < sizeof(json));
+        { std::ofstream file(path, std::ios::binary); const uint64_t header_bytes = static_cast<uint64_t>(written); file.write(reinterpret_cast<const char *>(&header_bytes), sizeof(header_bytes)); file.write(json, written); file.write(reinterpret_cast<const char *>(payloads[kind]), sizeof(payloads[kind])); }
+        lm_model_file *model = nullptr;
+        char error[128] = {};
+        assert(lm_model_open(path, &model, error, sizeof(error)) == LM_OK);
+        lm_model_tensor_info info{};
+        assert(lm_model_tensor_info_at(model, 0u, &info) == LM_OK && info.type == (kind == 0u ? LM_DTYPE_F16 : LM_DTYPE_BF16));
+        lm_file_span span{};
+        uint16_t raw[4] = {};
+        assert(lm_model_tensor_span_at(model, 0u, sizeof(raw), &span) == LM_OK);
+        assert(lm_file_span_read(&span, 0u, raw, sizeof(raw)) == LM_OK && std::memcmp(raw, payloads[kind], sizeof(raw)) == 0);
+        float scratch[4] = {};
+        const float input[] = {1.0f, 2.0f};
+        float output[2] = {};
+        assert(lm_model_tensor_matvec_f32_cpu(model, 0u, scratch, sizeof(scratch), 2u, 2u, input, output) == LM_OK);
+        assert(std::fabs(output[0] - 5.0f) < 0.001f && std::fabs(output[1] - 11.0f) < 0.001f);
+        lm_model_close(model);
+        std::remove(path);
+    }
+}
+
+static void test_safetensors_f16_bf16_inference() {
+    const char *base_json = "{\"__metadata__\":{\"general.architecture\":\"llama\",\"llama.context_length\":\"4\",\"llama.embedding_length\":\"2\",\"llama.block_count\":\"1\",\"llama.attention.head_count\":\"1\",\"llama.attention.head_count_kv\":\"1\",\"llama.feed_forward_length\":\"2\",\"llama.rope.freq_base\":\"10000\",\"tokenizer.token.0\":\"a\",\"tokenizer.token.1\":\"b\"},\"token_embd.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,16]},\"output.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[16,32]},\"output_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[32,40]},\"blk.0.attn_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[40,48]},\"blk.0.attn_q.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[48,64]},\"blk.0.attn_k.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[64,80]},\"blk.0.attn_v.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[80,96]},\"blk.0.attn_output.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[96,112]},\"blk.0.ffn_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[112,120]},\"blk.0.ffn_gate.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[120,136]},\"blk.0.ffn_down.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[136,152]},\"blk.0.ffn_up.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[152,168]}}";
+    const char *old_offsets[] = {"[0,16]", "[16,32]", "[32,40]", "[40,48]", "[48,64]", "[64,80]", "[80,96]", "[96,112]", "[112,120]", "[120,136]", "[136,152]", "[152,168]"};
+    const char *new_offsets[] = {"[0,8]", "[8,16]", "[16,20]", "[20,24]", "[24,32]", "[32,40]", "[40,48]", "[48,56]", "[56,60]", "[60,68]", "[68,76]", "[76,84]"};
+    const uint16_t f16_one = 0x3c00u;
+    const uint16_t bf16_one = 0x3f80u;
+    for (unsigned kind = 0u; kind < 2u; ++kind) {
+        std::string json(base_json);
+        size_t position = 0u;
+        while ((position = json.find("\"F32\"", position)) != std::string::npos) {
+            json.replace(position, 5u, kind == 0u ? "\"F16\"" : "\"BF16\"");
+            position += 5u;
+        }
+        for (unsigned i = 0u; i < 12u; ++i) {
+            position = json.find(old_offsets[i]);
+            assert(position != std::string::npos);
+            json.replace(position, std::strlen(old_offsets[i]), new_offsets[i]);
+        }
+        const char *path = kind == 0u ? "test-f16-inference.safetensors" : "test-bf16-inference.safetensors";
+        { std::ofstream file(path, std::ios::binary); const uint64_t header_bytes = json.size(); file.write(reinterpret_cast<const char *>(&header_bytes), sizeof(header_bytes)); file.write(json.data(), static_cast<std::streamsize>(json.size())); uint16_t payload[42] = {}; const uint16_t one = kind == 0u ? f16_one : bf16_one; payload[0] = one; payload[3] = one; payload[4] = one; payload[7] = one; payload[8] = one; payload[9] = one; payload[10] = one; payload[11] = one; payload[22] = one; payload[25] = one; payload[34] = one; payload[37] = one; file.write(reinterpret_cast<const char *>(payload), sizeof(payload)); }
+        lm_model_file *model = nullptr;
+        char error[128] = {};
+        assert(lm_model_open(path, &model, error, sizeof(error)) == LM_OK);
+        lm_decoder_graph_binding graph{};
+        assert(lm_model_build_llama_graph(model, &graph) == LM_OK && graph.layer_count == 1u);
+        lm_native_mlp_config config{};
+        config.matvec = {LM_BACKEND_CPU, 0u, nullptr, nullptr};
+        config.layer_index = 0u; config.vocab_size = 2u; config.hidden_size = 2u;
+        config.intermediate_size = 2u; config.matrix_format = LM_QUANT_NONE; config.rms_epsilon = 1.0e-5f;
+        unsigned char scratch[256] = {};
+        float logits[2] = {};
+        assert(lm_model_execute_native_mlp_logits(model, &graph, &config, 0u, scratch, sizeof(scratch), logits, 2u) == LM_OK);
+        const float scale = 1.0f / std::sqrt(0.5f + config.rms_epsilon);
+        assert(std::fabs(logits[0] - scale) < 0.002f && std::fabs(logits[1]) < 0.002f);
+        lm_model_close(model);
+        std::remove(path);
+    }
+}
+
 static void test_safetensors_native_mlp() {
     const char *path = "test-native-f32.safetensors";
     const char *json = "{\"__metadata__\":{\"general.architecture\":\"llama\",\"llama.context_length\":\"4\",\"llama.embedding_length\":\"2\",\"llama.block_count\":\"1\",\"llama.attention.head_count\":\"1\",\"llama.attention.head_count_kv\":\"1\",\"llama.feed_forward_length\":\"2\",\"llama.rope.freq_base\":\"10000\",\"tokenizer.token.0\":\"a\",\"tokenizer.token.1\":\"b\"},\"token_embd.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,16]},\"output.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[16,32]},\"output_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[32,40]},\"blk.0.attn_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[40,48]},\"blk.0.attn_q.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[48,64]},\"blk.0.attn_k.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[64,80]},\"blk.0.attn_v.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[80,96]},\"blk.0.attn_output.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[96,112]},\"blk.0.ffn_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[112,120]},\"blk.0.ffn_gate.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[120,136]},\"blk.0.ffn_down.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[136,152]},\"blk.0.ffn_up.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[152,168]}}";
@@ -742,6 +812,34 @@ static void test_safetensors_native_mlp() {
                                         scratch, sizeof(scratch), step_logits, 2u) == LM_OK);
     assert(std::fabs(transformer_logits[0] - step_logits[0]) < 1.0e-6f);
     assert(std::fabs(transformer_logits[1] - step_logits[1]) < 1.0e-6f);
+    const lm_kv_dtype typed_dtypes[] = {LM_KV_F16, LM_KV_BF16, LM_KV_Q8, LM_KV_Q6, LM_KV_Q4};
+    for (lm_kv_dtype dtype : typed_dtypes) {
+        lm_kv_cache *typed_cache = nullptr;
+        assert(lm_kv_cache_create_typed(1u, 4u, dtype, 2u, 2u, &typed_cache) == LM_OK);
+        uint32_t typed_page = UINT32_MAX;
+        assert(lm_kv_cache_append(typed_cache, &typed_page, 1u) == LM_OK);
+        float typed_logits[2] = {};
+        assert(lm_model_execute_native_transformer(model, &graph, &transformer, 0u, &typed_cache, 1u,
+                                                   typed_page, scratch, sizeof(scratch),
+                                                   typed_logits, 2u) == LM_OK);
+        assert(std::fabs(typed_logits[0] - transformer_logits[0]) < 0.02f);
+        assert(std::fabs(typed_logits[1] - transformer_logits[1]) < 0.02f);
+        lm_kv_cache_destroy(typed_cache);
+    }
+#if LM_HAS_VULKAN
+    lm_kv_cache *unsupported_typed_cache = nullptr;
+    assert(lm_kv_cache_create_typed(1u, 4u, LM_KV_F16, 2u, 2u, &unsupported_typed_cache) == LM_OK);
+    uint32_t unsupported_page = UINT32_MAX;
+    assert(lm_kv_cache_append(unsupported_typed_cache, &unsupported_page, 1u) == LM_OK);
+    lm_native_transformer_config unsupported_transformer = transformer;
+    unsupported_transformer.step.matvec.backend = LM_BACKEND_VULKAN;
+    unsupported_transformer.step.matvec.shader_path = "matvec_f32.comp.spv";
+    float unsupported_logits[2] = {};
+    assert(lm_model_execute_native_transformer(model, &graph, &unsupported_transformer, 0u,
+                                               &unsupported_typed_cache, 1u, unsupported_page,
+                                               scratch, sizeof(scratch), unsupported_logits, 2u) == LM_ERR_UNSUPPORTED);
+    lm_kv_cache_destroy(unsupported_typed_cache);
+#endif
     transformer.has_architecture = 0u;
     assert(lm_model_execute_native_transformer(model, &graph, &transformer, 0u, layer_caches, 1u,
                                                transformer_page, scratch, sizeof(scratch),
@@ -759,6 +857,16 @@ static void test_safetensors_native_mlp() {
     assert(lm_model_generate_native(model, &graph, &generation, prompt_tokens, 1u, scratch, sizeof(scratch),
                                      generated_tokens, 1u, &generated_count) == LM_OK);
     assert(generated_count == 1u && generated_tokens[0] < 2u);
+    const lm_kv_dtype generation_dtypes[] = {LM_KV_F16, LM_KV_BF16, LM_KV_Q8, LM_KV_Q6, LM_KV_Q4};
+    for (lm_kv_dtype dtype : generation_dtypes) {
+        generation.use_typed_kv = 1u;
+        generation.kv_dtype = dtype;
+        generated_count = 0u;
+        assert(lm_model_generate_native(model, &graph, &generation, prompt_tokens, 1u, scratch, sizeof(scratch),
+                                         generated_tokens, 1u, &generated_count) == LM_OK);
+        assert(generated_count == 1u && generated_tokens[0] < 2u);
+    }
+    generation.use_typed_kv = 0u;
     TokenCapture capture;
     assert(lm_model_generate_native_stream(model, &graph, &generation, prompt_tokens, 1u,
                                            scratch, sizeof(scratch), capture_token, &capture) == LM_OK);
@@ -1734,6 +1842,10 @@ static void test_kv_typed_codecs() {
         uint32_t key_bytes = 0u, value_bytes = 0u;
         assert(lm_kv_cache_get_payload_layout(cache, &key_bytes, &value_bytes) == LM_OK &&
                key_bytes == expected_bytes[kind] && value_bytes == expected_bytes[kind]);
+        lm_kv_dtype codec_dtype = LM_KV_F16;
+        uint32_t codec_key_elements = 0u, codec_value_elements = 0u;
+        assert(lm_kv_cache_get_codec(cache, &codec_dtype, &codec_key_elements, &codec_value_elements) == LM_OK &&
+               codec_dtype == dtypes[kind] && codec_key_elements == 32u && codec_value_elements == 32u);
         std::vector<float> keys(64u), values(64u), decoded_keys(64u), decoded_values(64u);
         for (size_t i = 0u; i < keys.size(); ++i) {
             keys[i] = -1.75f + static_cast<float>(i) * 0.03125f;
@@ -1765,6 +1877,9 @@ static void test_kv_typed_codecs() {
     lm_kv_cache *opaque = nullptr;
     assert(lm_kv_cache_create_with_payload(1u, 1u, 64u, 64u, &opaque) == LM_OK);
     float values[32] = {};
+    lm_kv_dtype opaque_dtype = LM_KV_F16;
+    uint32_t opaque_key_elements = 0u, opaque_value_elements = 0u;
+    assert(lm_kv_cache_get_codec(opaque, &opaque_dtype, &opaque_key_elements, &opaque_value_elements) == LM_ERR_UNSUPPORTED);
     assert(lm_kv_cache_write_f32(opaque, 0u, 0u, 1u, values, values) == LM_ERR_UNSUPPORTED);
     lm_kv_cache_destroy(opaque);
 }
@@ -1924,6 +2039,8 @@ int main() {
     test_model_and_cpu_math();
     test_safetensors_parser();
     test_safetensors_native_mlp();
+    test_safetensors_f16_bf16_matvec();
+    test_safetensors_f16_bf16_inference();
     test_model_bound_f32_router();
     test_tokenizer_json_bpe();
     test_tokenizer();

@@ -8,6 +8,13 @@
 #include <cstdio>
 #include <vector>
 
+float half_to_float(uint16_t bits);
+
+static bool model_is_safetensors(const lm_model_file *model) {
+    lm_model_info info{};
+    return model && lm_model_get_info(model, &info) == LM_OK && info.format == LM_MODEL_SAFETENSORS;
+}
+
 struct lm_cpu_decoder {
     lm_cpu_decoder_config config;
     uint32_t position;
@@ -146,8 +153,10 @@ lm_status profile_matrix(const lm_model_file *model, uint64_t index,
     if (descriptor.rank != 2u || descriptor.dims[0] != rows || descriptor.dims[1] != columns)
         return LM_ERR_UNSUPPORTED;
     if (format == LM_QUANT_NONE) {
-        if (descriptor.type != LM_DTYPE_F32 || static_cast<uint64_t>(rows) > UINT64_MAX / columns)
-            return LM_ERR_UNSUPPORTED;
+        const bool scalar16 = descriptor.type == LM_DTYPE_F16 || descriptor.type == LM_DTYPE_BF16;
+        if (descriptor.type != LM_DTYPE_F32 &&
+            (!model_is_safetensors(model) || !scalar16)) return LM_ERR_UNSUPPORTED;
+        if (static_cast<uint64_t>(rows) > UINT64_MAX / columns) return LM_ERR_CAPACITY;
         const uint64_t elements = static_cast<uint64_t>(rows) * columns;
         if (elements > UINT64_MAX / sizeof(float)) return LM_ERR_CAPACITY;
         *payload_bytes = elements * sizeof(float);
@@ -167,19 +176,39 @@ lm_status profile_vector(const lm_model_file *model, uint64_t index, uint32_t el
     lm_model_tensor_info descriptor{};
     const lm_status described = lm_model_tensor_info_at(model, index, &descriptor);
     if (described != LM_OK) return described;
-    if (descriptor.rank != 1u || descriptor.dims[0] != elements || descriptor.type != LM_DTYPE_F32)
-        return LM_ERR_UNSUPPORTED;
-    const uint64_t bytes = static_cast<uint64_t>(elements) * sizeof(float);
+    const bool scalar16 = descriptor.type == LM_DTYPE_F16 || descriptor.type == LM_DTYPE_BF16;
+    if (descriptor.rank != 1u || descriptor.dims[0] != elements ||
+        (descriptor.type != LM_DTYPE_F32 &&
+         (!model_is_safetensors(model) || !scalar16))) return LM_ERR_UNSUPPORTED;
+    const uint64_t source_element_bytes = descriptor.type == LM_DTYPE_F32 ? sizeof(float) : sizeof(uint16_t);
+    const uint64_t source_bytes = static_cast<uint64_t>(elements) * source_element_bytes;
     lm_file_span span{};
-    const lm_status spanned = lm_model_tensor_span_at(model, index, bytes, &span);
+    const lm_status spanned = lm_model_tensor_span_at(model, index, source_bytes, &span);
     if (spanned != LM_OK) return spanned;
     try {
         out->assign(elements, 0.0f);
     } catch (const std::bad_alloc &) {
         return LM_ERR_CAPACITY;
     }
-    const lm_status read = lm_file_span_read(&span, 0u, out->data(), static_cast<size_t>(bytes));
-    if (read != LM_OK) return read;
+    if (descriptor.type == LM_DTYPE_F32) {
+        const lm_status read = lm_file_span_read(&span, 0u, out->data(), static_cast<size_t>(source_bytes));
+        if (read != LM_OK) return read;
+    } else {
+        std::vector<unsigned char> source;
+        try { source.resize(static_cast<size_t>(source_bytes)); }
+        catch (const std::bad_alloc &) { return LM_ERR_CAPACITY; }
+        const lm_status read = lm_file_span_read(&span, 0u, source.data(), source.size());
+        if (read != LM_OK) return read;
+        for (uint32_t i = 0u; i < elements; ++i) {
+            uint16_t bits = 0u;
+            std::memcpy(&bits, source.data() + static_cast<size_t>(i) * sizeof(bits), sizeof(bits));
+            if (descriptor.type == LM_DTYPE_F16) out->at(i) = half_to_float(bits);
+            else {
+                uint32_t value = static_cast<uint32_t>(bits) << 16u;
+                std::memcpy(&out->at(i), &value, sizeof(value));
+            }
+        }
+    }
     return finite_array(out->data(), out->size()) ? LM_OK : LM_ERR_RANGE;
 }
 
@@ -191,7 +220,13 @@ lm_status profile_matvec(const lm_model_file *model, uint64_t index,
     lm_model_tensor_info descriptor{};
     const lm_status described = lm_model_tensor_info_at(model, index, &descriptor);
     if (described != LM_OK) return described;
-    if (descriptor.type == LM_DTYPE_F32) {
+    const bool scalar16 = descriptor.type == LM_DTYPE_F16 || descriptor.type == LM_DTYPE_BF16;
+    if (descriptor.type == LM_DTYPE_F32 || scalar16) {
+        if (scalar16 && (!model_is_safetensors(model) || config->backend != LM_BACKEND_CPU))
+            return LM_ERR_UNSUPPORTED;
+        if (scalar16 && config->backend == LM_BACKEND_CPU)
+            return lm_model_tensor_matvec_f32_cpu(model, index, packed_scratch, packed_scratch_bytes,
+                                                  rows, columns, input, out);
         if (!model || !packed_scratch || !input || !out || rows == 0u || columns == 0u ||
             static_cast<uint64_t>(rows) > UINT64_MAX / columns) return LM_ERR_ARGUMENT;
         const uint64_t elements = static_cast<uint64_t>(rows) * columns;
@@ -425,8 +460,18 @@ lm_status lm_model_execute_native_attention(const lm_model_file *model,
     uint32_t value_bytes = 0u;
     lm_status status = lm_kv_cache_get_payload_layout(kv_cache, &key_bytes, &value_bytes);
     if (status != LM_OK) return status;
-    if (key_bytes != kv_width * sizeof(float) || value_bytes != kv_width * sizeof(float))
+    lm_kv_dtype cache_dtype = LM_KV_F16;
+    uint32_t key_elements = 0u;
+    uint32_t value_elements = 0u;
+    const lm_status codec_status = lm_kv_cache_get_codec(kv_cache, &cache_dtype, &key_elements, &value_elements);
+    const bool typed_cache = codec_status == LM_OK;
+    if (!typed_cache && codec_status != LM_ERR_UNSUPPORTED) return codec_status;
+    if (typed_cache) {
+        if (config->matvec.backend == LM_BACKEND_VULKAN) return LM_ERR_UNSUPPORTED;
+        if (key_elements != kv_width || value_elements != kv_width) return LM_ERR_UNSUPPORTED;
+    } else if (key_bytes != kv_width * sizeof(float) || value_bytes != kv_width * sizeof(float)) {
         return LM_ERR_UNSUPPORTED;
+    }
     const lm_decoder_layer_binding &layer = graph->layers[config->layer_index];
     uint64_t max_payload = 0u;
     const uint32_t matrix_rows[] = {config->hidden_size, kv_width,
@@ -484,10 +529,17 @@ lm_status lm_model_execute_native_attention(const lm_model_file *model,
         apply_rope(q.data(), config->hidden_size, config->token_offset, config->rope_theta);
         apply_rope(k.data(), kv_width, config->token_offset, config->rope_theta);
     }
-    status = lm_kv_cache_write_payload(kv_cache, page_id, config->token_offset, 1u, k.data(), v.data());
+    if (typed_cache)
+        status = lm_kv_cache_write_f32(kv_cache, page_id, config->token_offset, 1u, k.data(), v.data());
+    else
+        status = lm_kv_cache_write_payload(kv_cache, page_id, config->token_offset, 1u, k.data(), v.data());
     if (status != LM_OK) return status;
-    status = lm_kv_cache_read_payload(kv_cache, page_id, 0u, config->token_offset + 1u,
+    if (typed_cache)
+        status = lm_kv_cache_read_f32(kv_cache, page_id, 0u, config->token_offset + 1u,
                                       keys.data(), values.data());
+    else
+        status = lm_kv_cache_read_payload(kv_cache, page_id, 0u, config->token_offset + 1u,
+                                           keys.data(), values.data());
     if (status != LM_OK) return status;
     const float attention_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     const uint32_t query_groups = config->head_count / config->head_count_kv;
@@ -752,6 +804,7 @@ static lm_status lm_model_generate_native_impl(const lm_model_file *model,
                                   config->step.head_count) * config->step.head_count_kv;
     if (kv_elements == 0u || kv_elements > UINT32_MAX / sizeof(float)) return LM_ERR_CAPACITY;
     const uint32_t kv_bytes = static_cast<uint32_t>(kv_elements * sizeof(float));
+    if (config->use_typed_kv != 0u && config->kv_dtype > LM_KV_Q4) return LM_ERR_ARGUMENT;
     std::vector<lm_kv_cache *> layer_caches;
     std::vector<uint8_t> page_live;
     std::vector<float> logits;
@@ -771,8 +824,13 @@ static lm_status lm_model_generate_native_impl(const lm_model_file *model,
     };
     lm_status status = LM_OK;
     for (uint32_t layer = 0u; layer < graph->layer_count; ++layer) {
-        status = lm_kv_cache_create_with_payload(1u, context_tokens, kv_bytes, kv_bytes,
-                                                 &layer_caches[layer]);
+        if (config->use_typed_kv != 0u)
+            status = lm_kv_cache_create_typed(1u, context_tokens, config->kv_dtype,
+                                              static_cast<uint32_t>(kv_elements),
+                                              static_cast<uint32_t>(kv_elements), &layer_caches[layer]);
+        else
+            status = lm_kv_cache_create_with_payload(1u, context_tokens, kv_bytes, kv_bytes,
+                                                     &layer_caches[layer]);
         if (status != LM_OK) break;
     }
     if (status == LM_OK) {
