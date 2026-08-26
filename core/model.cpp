@@ -13,6 +13,8 @@
 struct lm_model_file {
     lm_file *file;
     lm_model_info info;
+    lm_model_architecture architecture;
+    uint8_t has_architecture;
     std::vector<lm_model_tensor_info> tensors;
     std::vector<std::string> tokens;
 };
@@ -187,6 +189,34 @@ bool read_moe_count(BinaryReader &reader, uint32_t type, uint64_t *count) {
     return false;
 }
 
+bool read_arch_u32(BinaryReader &reader, uint32_t type, uint32_t *value) {
+    if (!value) return false;
+    uint64_t parsed = 0u;
+    if (!read_moe_count(reader, type, &parsed) || parsed == 0u || parsed > UINT32_MAX) return false;
+    *value = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+bool read_arch_float(BinaryReader &reader, uint32_t type, float *value) {
+    if (!value) return false;
+    if (type == 6u) {
+        uint32_t bits = 0u;
+        if (!reader.u32(&bits)) return false;
+        std::memcpy(value, &bits, sizeof(bits));
+        return std::isfinite(*value) && *value > 0.0f;
+    }
+    if (type == 12u) {
+        uint64_t bits = 0u;
+        if (!reader.u64(&bits)) return false;
+        double parsed = 0.0;
+        std::memcpy(&parsed, &bits, sizeof(bits));
+        if (!std::isfinite(parsed) || parsed <= 0.0 || parsed > static_cast<double>(std::numeric_limits<float>::max())) return false;
+        *value = static_cast<float>(parsed);
+        return std::isfinite(*value) && *value > 0.0f;
+    }
+    return false;
+}
+
 bool read_token_array(BinaryReader &reader, uint32_t type, std::vector<std::string> *tokens) {
     if (type != 9u || !tokens) return false;
     uint32_t element_type = 0u;
@@ -211,7 +241,8 @@ bool read_token_array(BinaryReader &reader, uint32_t type, std::vector<std::stri
 
 lm_status inspect_gguf(const char *path, lm_model_info *out_info, char *error_text, size_t error_capacity,
                        std::vector<lm_model_tensor_info> *out_tensors = nullptr,
-                       std::vector<std::string> *out_tokens = nullptr) {
+                       std::vector<std::string> *out_tokens = nullptr,
+                       lm_model_architecture *out_architecture = nullptr) {
     BinaryReader reader(path);
     if (!reader.good()) { set_error(error_text, error_capacity, "cannot open model file"); return LM_ERR_IO; }
     if (reader.size() < 24u) { set_error(error_text, error_capacity, "GGUF header is truncated"); return LM_ERR_PARSE; }
@@ -233,6 +264,15 @@ lm_status inspect_gguf(const char *path, lm_model_info *out_info, char *error_te
     bool has_expert_count = false;
     bool has_experts_per_token = false;
     std::vector<std::string> tokens;
+    lm_model_architecture architecture{};
+    bool is_llama = false;
+    bool has_context_length = false;
+    bool has_embedding_length = false;
+    bool has_block_count = false;
+    bool has_head_count = false;
+    bool has_head_count_kv = false;
+    bool has_intermediate_length = false;
+    bool has_rope_frequency_base = false;
     for (uint64_t i = 0u; i < metadata_count; ++i) {
         std::string key;
         uint32_t type = 0u;
@@ -240,7 +280,13 @@ lm_status inspect_gguf(const char *path, lm_model_info *out_info, char *error_te
             set_error(error_text, error_capacity, "invalid GGUF metadata entry"); return LM_ERR_PARSE;
         }
         const uint64_t old_alignment = alignment;
-        if (key == "general.alignment") {
+        if (key == "general.architecture") {
+            std::string architecture_name;
+            if (type != 8u || !reader.string(&architecture_name, 64u)) {
+                set_error(error_text, error_capacity, "invalid GGUF architecture metadata"); return LM_ERR_PARSE;
+            }
+            if (architecture_name == "llama") is_llama = true;
+        } else if (key == "general.alignment") {
             if (!read_gguf_alignment(reader, type, &alignment)) {
                 set_error(error_text, error_capacity, "invalid GGUF alignment metadata"); return LM_ERR_PARSE;
             }
@@ -261,10 +307,37 @@ lm_status inspect_gguf(const char *path, lm_model_info *out_info, char *error_te
             if (!tokens.empty() || !read_token_array(reader, type, &tokens)) {
                 set_error(error_text, error_capacity, "invalid GGUF token vocabulary metadata"); return LM_ERR_PARSE;
             }
+        } else if (key == "llama.context_length") {
+            if (has_context_length || !read_arch_u32(reader, type, &architecture.context_length)) return LM_ERR_PARSE;
+            has_context_length = true;
+        } else if (key == "llama.embedding_length") {
+            if (has_embedding_length || !read_arch_u32(reader, type, &architecture.embedding_length)) return LM_ERR_PARSE;
+            has_embedding_length = true;
+        } else if (key == "llama.block_count") {
+            if (has_block_count || !read_arch_u32(reader, type, &architecture.block_count)) return LM_ERR_PARSE;
+            has_block_count = true;
+        } else if (key == "llama.attention.head_count") {
+            if (has_head_count || !read_arch_u32(reader, type, &architecture.head_count)) return LM_ERR_PARSE;
+            has_head_count = true;
+        } else if (key == "llama.attention.head_count_kv") {
+            if (has_head_count_kv || !read_arch_u32(reader, type, &architecture.head_count_kv)) return LM_ERR_PARSE;
+            has_head_count_kv = true;
+        } else if (key == "llama.feed_forward_length") {
+            if (has_intermediate_length || !read_arch_u32(reader, type, &architecture.intermediate_length)) return LM_ERR_PARSE;
+            has_intermediate_length = true;
+        } else if (key == "llama.rope.freq_base") {
+            if (has_rope_frequency_base || !read_arch_float(reader, type, &architecture.rope_frequency_base)) return LM_ERR_PARSE;
+            has_rope_frequency_base = true;
         } else if (!skip_gguf_value(reader, type, 0u)) {
             set_error(error_text, error_capacity, "invalid GGUF metadata value"); return LM_ERR_PARSE;
         }
         if (key != "general.alignment") alignment = old_alignment;
+    }
+    if (out_architecture) *out_architecture = lm_model_architecture{};
+    if (is_llama && has_context_length && has_embedding_length && has_block_count && has_head_count &&
+        has_head_count_kv && has_intermediate_length && has_rope_frequency_base &&
+        architecture.head_count_kv <= architecture.head_count && architecture.embedding_length > 0u) {
+        if (out_architecture) *out_architecture = architecture;
     }
     if ((has_expert_count != has_experts_per_token) || expert_count == 0u || experts_per_token == 0u ||
         expert_count > UINT32_MAX || experts_per_token > UINT32_MAX || experts_per_token > expert_count) {
@@ -588,8 +661,9 @@ lm_status lm_model_open(const char *path, lm_model_file **out_model, char *error
     lm_file *file = nullptr;
     std::vector<lm_model_tensor_info> tensors;
     std::vector<std::string> tokens;
+    lm_model_architecture architecture{};
     if (info.format == LM_MODEL_GGUF) {
-        const lm_status descriptors = inspect_gguf(path, &info, error_text, error_capacity, &tensors, &tokens);
+        const lm_status descriptors = inspect_gguf(path, &info, error_text, error_capacity, &tensors, &tokens, &architecture);
         if (descriptors != LM_OK) return descriptors;
     } else if (info.format == LM_MODEL_SAFETENSORS) {
         const lm_status descriptors = inspect_safetensors(path, &info, error_text, error_capacity, &tensors);
@@ -598,7 +672,9 @@ lm_status lm_model_open(const char *path, lm_model_file **out_model, char *error
     const lm_status opened = lm_file_open(path, &file);
     if (opened != LM_OK) return opened;
     try {
-        lm_model_file *model = new lm_model_file{file, info, std::move(tensors), std::move(tokens)};
+        lm_model_file *model = new lm_model_file{file, info, architecture,
+                                                   static_cast<uint8_t>(architecture.block_count != 0u),
+                                                   std::move(tensors), std::move(tokens)};
         *out_model = model;
         return LM_OK;
     } catch (const std::bad_alloc &) {
@@ -616,6 +692,13 @@ void lm_model_close(lm_model_file *model) {
 lm_status lm_model_get_info(const lm_model_file *model, lm_model_info *out_info) {
     if (!model || !out_info) return LM_ERR_ARGUMENT;
     *out_info = model->info;
+    return LM_OK;
+}
+
+lm_status lm_model_get_architecture(const lm_model_file *model, lm_model_architecture *out_architecture) {
+    if (!model || !out_architecture) return LM_ERR_ARGUMENT;
+    if (model->has_architecture == 0u) return LM_ERR_UNSUPPORTED;
+    *out_architecture = model->architecture;
     return LM_OK;
 }
 

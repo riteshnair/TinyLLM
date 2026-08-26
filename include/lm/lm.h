@@ -272,6 +272,17 @@ typedef struct lm_model_info {
     uint32_t experts_per_token;
 } lm_model_info;
 
+/* Exact scalar metadata required by the narrow llama execution profile; absent for other architectures. */
+typedef struct lm_model_architecture {
+    uint32_t context_length;
+    uint32_t embedding_length;
+    uint32_t block_count;
+    uint32_t head_count;
+    uint32_t head_count_kv;
+    uint32_t intermediate_length;
+    float rope_frequency_base;
+} lm_model_architecture;
+
 typedef struct lm_model_tensor_info {
     char name[65];
     uint32_t rank;
@@ -298,6 +309,7 @@ typedef struct lm_native_matvec_config {
 lm_status lm_model_open(const char *path, lm_model_file **out_model, char *error_text, size_t error_capacity);
 void lm_model_close(lm_model_file *model);
 lm_status lm_model_get_info(const lm_model_file *model, lm_model_info *out_info);
+lm_status lm_model_get_architecture(const lm_model_file *model, lm_model_architecture *out_architecture);
 lm_status lm_model_tensor_info_at(const lm_model_file *model, uint64_t index, lm_model_tensor_info *out_info);
 lm_status lm_model_token_count(const lm_model_file *model, uint32_t *out_count);
 lm_status lm_model_token_at(const lm_model_file *model, uint32_t token_id,
@@ -342,6 +354,7 @@ lm_status lm_model_tensor_matvec_native(const lm_model_file *model, uint64_t ten
                                         void *packed_scratch, uint64_t scratch_bytes,
                                         uint32_t rows, uint32_t columns,
                                         const float *input, float *out);
+/* Reads one exact F32 matrix into caller scratch; no dtype conversion or model-wide expansion occurs. */
 lm_status lm_model_tensor_matvec_f32_cpu(const lm_model_file *model, uint64_t tensor_index,
                                          void *matrix_scratch, uint64_t scratch_bytes,
                                          uint32_t rows, uint32_t columns,

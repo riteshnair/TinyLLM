@@ -447,6 +447,35 @@ static void test_native_mlp_profile() {
     gguf[0] = 'G'; gguf[1] = 'G'; gguf[2] = 'U'; gguf[3] = 'F';
     gguf[4] = 3u;
     gguf[16] = 1u;
+    auto put_key_string = [&gguf, &put_u32, &put_u64](const char *key, const char *value) {
+        put_u64(&gguf, std::strlen(key));
+        gguf.insert(gguf.end(), key, key + std::strlen(key));
+        put_u32(&gguf, 8u);
+        put_u64(&gguf, std::strlen(value));
+        gguf.insert(gguf.end(), value, value + std::strlen(value));
+    };
+    auto put_key_u32 = [&gguf, &put_u32, &put_u64](const char *key, uint32_t value) {
+        put_u64(&gguf, std::strlen(key));
+        gguf.insert(gguf.end(), key, key + std::strlen(key));
+        put_u32(&gguf, 4u);
+        put_u32(&gguf, value);
+    };
+    auto put_key_f32 = [&gguf, &put_u32, &put_u64](const char *key, float value) {
+        uint32_t bits = 0u;
+        std::memcpy(&bits, &value, sizeof(bits));
+        put_u64(&gguf, std::strlen(key));
+        gguf.insert(gguf.end(), key, key + std::strlen(key));
+        put_u32(&gguf, 6u);
+        put_u32(&gguf, bits);
+    };
+    put_key_string("general.architecture", "llama");
+    put_key_u32("llama.context_length", 4096u);
+    put_key_u32("llama.embedding_length", hidden);
+    put_key_u32("llama.block_count", 2u);
+    put_key_u32("llama.attention.head_count", 1u);
+    put_key_u32("llama.attention.head_count_kv", 1u);
+    put_key_u32("llama.feed_forward_length", intermediate);
+    put_key_f32("llama.rope.freq_base", 10000.0f);
     const char *vocabulary_key = "tokenizer.ggml.tokens";
     put_u64(&gguf, std::strlen(vocabulary_key));
     gguf.insert(gguf.end(), vocabulary_key, vocabulary_key + std::strlen(vocabulary_key));
@@ -459,6 +488,7 @@ static void test_native_mlp_profile() {
         gguf.insert(gguf.end(), token, token + std::strlen(token));
     }
     gguf[8] = static_cast<unsigned char>(specs.size());
+    gguf[16] = 9u;
     for (const Spec &spec : specs) {
         const size_t length = std::strlen(spec.name);
         put_u64(&gguf, length);
@@ -516,6 +546,12 @@ static void test_native_mlp_profile() {
     lm_decoder_graph_binding graph{};
     assert(lm_model_build_llama_graph(model, &graph) == LM_OK);
     assert(graph.layer_count == 2u);
+    lm_model_architecture architecture{};
+    assert(lm_model_get_architecture(model, &architecture) == LM_OK);
+    assert(architecture.context_length == 4096u && architecture.embedding_length == hidden &&
+           architecture.block_count == 2u && architecture.head_count == 1u &&
+           architecture.head_count_kv == 1u && architecture.intermediate_length == intermediate &&
+           architecture.rope_frequency_base == 10000.0f);
     lm_native_mlp_config config{};
     config.matvec = {LM_BACKEND_CPU, 0u, nullptr};
     config.layer_index = 0u;
