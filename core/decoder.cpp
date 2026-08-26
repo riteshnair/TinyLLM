@@ -66,7 +66,7 @@ bool rms_norm(const float *input, uint32_t size, float epsilon, const float *gam
     return finite_array(output, size);
 }
 
-void apply_rope(float *vector, uint32_t size, uint32_t position, float theta) {
+void apply_rope(float *vector, uint32_t size, float position, float theta) {
     for (uint32_t i = 0u; i + 1u < size; i += 2u) {
         const float frequency = std::pow(theta, -static_cast<float>(i) / static_cast<float>(size));
         const float angle = static_cast<float>(position) * frequency;
@@ -536,6 +536,8 @@ lm_status lm_model_execute_native_attention(const lm_model_file *model,
         config->head_count_kv == 0u || config->head_count_kv > config->head_count ||
         config->head_count % config->head_count_kv != 0u || config->hidden_size % config->head_count != 0u ||
         config->token_offset >= (1u << 20u) ||
+        (config->attention_window > (1u << 20u)) ||
+        (config->rope_scale != 0.0f && (!(config->rope_scale > 0.0f) || !std::isfinite(config->rope_scale))) ||
         (config->matrix_format != LM_QUANT_NONE && config->matrix_format != LM_QUANT_GGML_Q8_0 &&
          config->matrix_format != LM_QUANT_GGML_Q4_K) ||
         (config->use_rope && (!(config->rope_theta > 1.0f) || !std::isfinite(config->rope_theta))) ||
@@ -584,10 +586,12 @@ lm_status lm_model_execute_native_attention(const lm_model_file *model,
         projected.assign(config->hidden_size, 0.0f);
         attended.assign(config->hidden_size, 0.0f);
         const size_t context = static_cast<size_t>(config->token_offset) + 1u;
-        keys.assign(context * kv_width, 0.0f);
-        values.assign(context * kv_width, 0.0f);
-        scores.assign(context, 0.0f);
-        weights.assign(context, 0.0f);
+        const size_t window = config->attention_window == 0u ? context :
+                              std::min(context, static_cast<size_t>(config->attention_window));
+        keys.assign(window * kv_width, 0.0f);
+        values.assign(window * kv_width, 0.0f);
+        scores.assign(window, 0.0f);
+        weights.assign(window, 0.0f);
     } catch (const std::bad_alloc &) {
         return LM_ERR_CAPACITY;
     }
@@ -614,19 +618,26 @@ lm_status lm_model_execute_native_attention(const lm_model_file *model,
                             config->hidden_size, norm.data(), v.data());
     if (status != LM_OK) return status;
     if (config->use_rope) {
-        apply_rope(q.data(), config->hidden_size, config->token_offset, config->rope_theta);
-        apply_rope(k.data(), kv_width, config->token_offset, config->rope_theta);
+        const float rope_scale = config->rope_scale > 0.0f ? config->rope_scale : 1.0f;
+        const float rope_position = static_cast<float>(config->token_offset) / rope_scale;
+        if (!std::isfinite(rope_position)) return LM_ERR_RANGE;
+        apply_rope(q.data(), config->hidden_size, rope_position, config->rope_theta);
+        apply_rope(k.data(), kv_width, rope_position, config->rope_theta);
     }
     if (typed_cache)
         status = lm_kv_cache_write_f32(kv_cache, page_id, config->token_offset, 1u, k.data(), v.data());
     else
         status = lm_kv_cache_write_payload(kv_cache, page_id, config->token_offset, 1u, k.data(), v.data());
     if (status != LM_OK) return status;
+    const uint32_t context_count = config->token_offset + 1u;
+    const uint32_t window_count = config->attention_window == 0u ? context_count :
+                                  std::min(context_count, config->attention_window);
+    const uint32_t attention_start = context_count - window_count;
     if (typed_cache)
-        status = lm_kv_cache_read_f32(kv_cache, page_id, 0u, config->token_offset + 1u,
+        status = lm_kv_cache_read_f32(kv_cache, page_id, attention_start, window_count,
                                       keys.data(), values.data());
     else
-        status = lm_kv_cache_read_payload(kv_cache, page_id, 0u, config->token_offset + 1u,
+        status = lm_kv_cache_read_payload(kv_cache, page_id, attention_start, window_count,
                                            keys.data(), values.data());
     if (status != LM_OK) return status;
     const float attention_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
@@ -634,16 +645,16 @@ lm_status lm_model_execute_native_attention(const lm_model_file *model,
     for (uint32_t head = 0u; head < config->head_count; ++head) {
         const uint32_t kv_head = head / query_groups;
         const float *query = q.data() + static_cast<size_t>(head) * head_dim;
-        for (uint32_t t = 0u; t <= config->token_offset; ++t) {
+        for (uint32_t t = 0u; t < window_count; ++t) {
             const float *key = keys.data() + static_cast<size_t>(t) * kv_width + static_cast<size_t>(kv_head) * head_dim;
             float dot = 0.0f;
             for (uint32_t i = 0u; i < head_dim; ++i) dot += query[i] * key[i];
             scores[t] = dot * attention_scale;
         }
-        status = lm_cpu_softmax_f32(scores.data(), weights.data(), config->token_offset + 1u);
+        status = lm_cpu_softmax_f32(scores.data(), weights.data(), window_count);
         if (status != LM_OK) return status;
         float *head_output = attended.data() + static_cast<size_t>(head) * head_dim;
-        for (uint32_t t = 0u; t <= config->token_offset; ++t) {
+        for (uint32_t t = 0u; t < window_count; ++t) {
             const float *value = values.data() + static_cast<size_t>(t) * kv_width + static_cast<size_t>(kv_head) * head_dim;
             for (uint32_t i = 0u; i < head_dim; ++i) head_output[i] += weights[t] * value[i];
         }
@@ -811,6 +822,8 @@ lm_status lm_model_execute_native_transformer(const lm_model_file *model,
         attention.rope_theta = config->step.rope_theta;
         attention.rms_epsilon = config->step.rms_epsilon;
         attention.matrix_format = config->step.matrix_format;
+        attention.attention_window = config->step.attention_window;
+        attention.rope_scale = config->step.rope_scale;
         status = lm_model_execute_native_attention(model, graph, &attention, hidden.data(),
                                                    layer_caches[layer_index], page_id,
                                                    packed_scratch, packed_scratch_bytes,
@@ -905,6 +918,7 @@ static lm_status lm_model_generate_native_impl(const lm_model_file *model,
         config->step.vocab_size > kNativeProfileMaxVocab ||
         config->step.intermediate_size == 0u ||
         config->step.intermediate_size > kNativeProfileMaxIntermediate ||
+        config->prefill_chunk_tokens > (1u << 20u) ||
         config->stop_string_count > 4u ||
         (config->has_stop_token && (config->stop_token >= config->step.vocab_size)))
         return LM_ERR_ARGUMENT;
@@ -973,21 +987,27 @@ static lm_status lm_model_generate_native_impl(const lm_model_file *model,
         transformer.step = config->step;
         transformer.has_architecture = config->has_architecture;
         transformer.architecture = config->architecture;
-        for (size_t i = 0u; i < prompt_count; ++i) {
-            for (uint32_t layer = 0u; layer < graph->layer_count; ++layer) {
-                uint32_t page_id = page_live[layer] == 0u ? UINT32_MAX : 0u;
-                status = lm_kv_cache_append(layer_caches[layer], &page_id, 1u);
-                if (status != LM_OK || page_id != 0u) break;
-                page_live[layer] = 1u;
+        const size_t prefill_chunk = config->prefill_chunk_tokens == 0u ? prompt_count :
+                                      static_cast<size_t>(config->prefill_chunk_tokens);
+        for (size_t chunk_start = 0u; chunk_start < prompt_count && status == LM_OK;) {
+            const size_t chunk_end = chunk_start + std::min(prefill_chunk, prompt_count - chunk_start);
+            for (size_t i = chunk_start; i < chunk_end; ++i) {
+                for (uint32_t layer = 0u; layer < graph->layer_count; ++layer) {
+                    uint32_t page_id = page_live[layer] == 0u ? UINT32_MAX : 0u;
+                    status = lm_kv_cache_append(layer_caches[layer], &page_id, 1u);
+                    if (status != LM_OK || page_id != 0u) break;
+                    page_live[layer] = 1u;
+                }
+                if (status != LM_OK) break;
+                transformer.step.token_offset = static_cast<uint32_t>(i);
+                status = lm_model_execute_native_transformer(model, graph, &transformer,
+                                                             prompt_tokens[i], layer_caches.data(),
+                                                             static_cast<uint32_t>(layer_caches.size()), 0u,
+                                                             packed_scratch, packed_scratch_bytes,
+                                                             logits.data(), logits.size());
+                if (status != LM_OK) break;
             }
-            if (status != LM_OK) break;
-            transformer.step.token_offset = static_cast<uint32_t>(i);
-            status = lm_model_execute_native_transformer(model, graph, &transformer,
-                                                         prompt_tokens[i], layer_caches.data(),
-                                                         static_cast<uint32_t>(layer_caches.size()), 0u,
-                                                         packed_scratch, packed_scratch_bytes,
-                                                         logits.data(), logits.size());
-            if (status != LM_OK) break;
+            chunk_start = chunk_end;
         }
         *out_count = 0u;
         for (uint32_t i = 0u; status == LM_OK && i < config->max_new_tokens; ++i) {
@@ -1217,8 +1237,8 @@ lm_status lm_cpu_decoder_step(lm_cpu_decoder *decoder, uint32_t token_id, float 
     matvec(norm1, decoder->config.wk, h, h, k);
     matvec(norm1, decoder->config.wv, h, h, v);
     if (decoder->config.use_rope) {
-        apply_rope(q, h, decoder->position, decoder->config.rope_theta);
-        apply_rope(k, h, decoder->position, decoder->config.rope_theta);
+        apply_rope(q, h, static_cast<float>(decoder->position), decoder->config.rope_theta);
+        apply_rope(k, h, static_cast<float>(decoder->position), decoder->config.rope_theta);
     }
     std::memcpy(decoder->keys.data() + static_cast<size_t>(decoder->position) * h, k, sizeof(float) * h);
     std::memcpy(decoder->values.data() + static_cast<size_t>(decoder->position) * h, v, sizeof(float) * h);

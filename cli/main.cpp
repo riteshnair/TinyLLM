@@ -27,6 +27,7 @@ static void print_help() {
     std::puts("  --dump-config --dry-run --list-devices --help");
     std::puts("  --generate --prompt TEXT --max-new-tokens N");
     std::puts("  --sampling greedy|top-k|top-p|typical --top-k N --top-p P --min-p P");
+    std::puts("  --attention-window N --rope-scale S --prefill-chunk-tokens N");
     std::puts("  --typical-p P --temperature T --repetition-penalty P --frequency-penalty P");
     std::puts("  --presence-penalty P --seed N");
     std::puts("  --tokenizer PATH --config PATH (required for standard HF SafeTensors)");
@@ -39,13 +40,17 @@ static void text_probe(void *, const lm_probe *probe) {
                 probe->kind, probe->bytes);
 }
 
-static bool parse_bounded_u32(const char *text, uint32_t *out) {
+static bool parse_u32_limit(const char *text, uint32_t *out, unsigned long limit) {
     if (!text || !out || text[0] == '\0') return false;
     char *end = nullptr;
     const unsigned long value = std::strtoul(text, &end, 10);
-    if (!end || *end != '\0' || value > 1024u) return false;
+    if (!end || *end != '\0' || value > limit) return false;
     *out = static_cast<uint32_t>(value);
     return true;
+}
+
+static bool parse_bounded_u32(const char *text, uint32_t *out) {
+    return parse_u32_limit(text, out, 1024u);
 }
 
 static bool parse_finite_float(const char *text, float *out) {
@@ -127,6 +132,9 @@ struct generation_assets {
     const char *tokenizer_path;
     const char *config_path;
     lm_sampling_config sampling;
+    uint32_t attention_window;
+    float rope_scale;
+    uint32_t prefill_chunk_tokens;
 };
 
 static lm_status run_native_generation(const lm_config &config, const generation_assets &assets,
@@ -327,12 +335,15 @@ static lm_status run_native_generation(const lm_config &config, const generation
     generation.step.rms_epsilon = architecture.rms_epsilon > 0.0f ? architecture.rms_epsilon : 1.0e-5f;
     generation.step.matrix_format = safetensors ? LM_QUANT_NONE :
                                     (matrix_type == 8u ? LM_QUANT_GGML_Q8_0 : LM_QUANT_GGML_Q4_K);
+    generation.step.attention_window = assets.attention_window;
+    generation.step.rope_scale = assets.rope_scale;
     generation.has_architecture = 1u;
     generation.architecture = architecture;
     generation.kv_dtype = config.kv_dtype;
     generation.use_typed_kv = execution_backend == LM_BACKEND_CPU ? 1u : 0u;
     generation.sampling = assets.sampling;
     generation.max_new_tokens = max_new_tokens;
+    generation.prefill_chunk_tokens = assets.prefill_chunk_tokens;
     size_t generated_bytes = 0u;
     if (callback) {
         if (result || result_bytes) { lm_model_close(model); return LM_ERR_ARGUMENT; }
@@ -641,6 +652,9 @@ int main(int argc, char **argv) {
     const char *tokenizer_path = nullptr;
     const char *config_path = nullptr;
     uint32_t max_new_tokens = 0u;
+    uint32_t attention_window = 0u;
+    uint32_t prefill_chunk_tokens = 0u;
+    float rope_scale = 0.0f;
     lm_sampling_config sampling{};
     lm_sampling_config_init(&sampling);
     std::vector<char *> filtered;
@@ -659,6 +673,18 @@ int main(int argc, char **argv) {
             if (!parse_bounded_u32(argv[++i], &max_new_tokens)) {
                 std::fprintf(stderr, "configuration error: invalid --max-new-tokens\\n");
                 return 2;
+            }
+        } else if (std::strcmp(argv[i], "--attention-window") == 0 && i + 1 < argc) {
+            if (!parse_u32_limit(argv[++i], &attention_window, 1u << 20u)) {
+                std::fprintf(stderr, "configuration error: invalid --attention-window\\n"); return 2;
+            }
+        } else if (std::strcmp(argv[i], "--prefill-chunk-tokens") == 0 && i + 1 < argc) {
+            if (!parse_u32_limit(argv[++i], &prefill_chunk_tokens, 1u << 20u)) {
+                std::fprintf(stderr, "configuration error: invalid --prefill-chunk-tokens\\n"); return 2;
+            }
+        } else if (std::strcmp(argv[i], "--rope-scale") == 0 && i + 1 < argc) {
+            if (!parse_finite_float(argv[++i], &rope_scale) || rope_scale < 0.0f) {
+                std::fprintf(stderr, "configuration error: invalid --rope-scale\\n"); return 2;
             }
         } else if (std::strcmp(argv[i], "--sampling") == 0 && i + 1 < argc) {
             const char *value = argv[++i];
@@ -709,7 +735,8 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "configuration error: --server requires --model\\n");
         return 2;
     }
-    const generation_assets assets{tokenizer_path, config_path, sampling};
+    const generation_assets assets{tokenizer_path, config_path, sampling, attention_window,
+                                   rope_scale, prefill_chunk_tokens};
     bool list_devices = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0) {

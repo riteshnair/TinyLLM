@@ -723,6 +723,10 @@ typedef struct lm_native_attention_config {
     float rope_theta;
     float rms_epsilon;
     lm_quant_format matrix_format;
+    /* 0 = all cached causal tokens; otherwise attend to the last N tokens. */
+    uint32_t attention_window;
+    /* 0 or 1 = unscaled positions; positive values use position / rope_scale. */
+    float rope_scale;
 } lm_native_attention_config;
 
 lm_status lm_model_execute_native_attention(const lm_model_file *model,
@@ -748,6 +752,10 @@ typedef struct lm_native_step_config {
     float rope_theta;
     float rms_epsilon;
     lm_quant_format matrix_format;
+    /* 0 = all cached causal tokens; otherwise attend to the last N tokens. */
+    uint32_t attention_window;
+    /* 0 or 1 = unscaled positions; positive values use position / rope_scale. */
+    float rope_scale;
 } lm_native_step_config;
 
 lm_status lm_model_execute_native_step(const lm_model_file *model,
@@ -811,6 +819,8 @@ typedef struct lm_native_generation_config {
     uint8_t use_typed_kv;
     const char *stop_strings[4];
     uint32_t stop_string_count;
+    /* 0 = one sequential prefill stream; otherwise split prompt work into chunks of at most N tokens. */
+    uint32_t prefill_chunk_tokens;
 } lm_native_generation_config;
 
 typedef lm_status (*lm_native_token_callback)(void *user, uint32_t token_id, float probability);

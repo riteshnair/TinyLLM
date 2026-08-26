@@ -48,3 +48,15 @@ cd /home/ubuntu/TinyLLM
 ```
 
 These commands exercise the validated narrow Llama profile only. They do not imply support for arbitrary transformer architectures, arbitrary tokenizer pipelines, all quantization formats, SafeTensors Vulkan execution, typed-KV Vulkan, or direct ROCr execution.
+
+## Configured-control smoke runs
+
+The newly exposed controls were also exercised from the repository root against the same artifacts. `--attention-window 2` selects the bounded causal range, `--rope-scale 2` applies the documented linear position division, and `--prefill-chunk-tokens 1` splits the prompt prefill into one-token work units while preserving sequential KV continuity.
+
+| Model and backend | Command suffix | Result |
+|---|---|---|
+| SmolLM GGUF Q8_0, CPU | `--attention-window 2 --rope-scale 2 --prefill-chunk-tokens 1` | **PASS**, exit 0, `generated=..` |
+| SmolLM GGUF Q8_0, Vulkan via llvmpipe | `--attention-window 2 --rope-scale 2 --prefill-chunk-tokens 1` | **PASS**, exit 0, `generated=..` |
+| Tiny random Llama SafeTensors F32, CPU | `--attention-window 2 --rope-scale 2 --prefill-chunk-tokens 1` | **PASS**, exit 0, `generated=ino película` |
+
+These controls are implemented in the narrow native path. Chunked prefill is a sequential bounded slice, not continuous-batch interleaving; sliding-window attention is currently CPU-side even when projection matvecs use Vulkan; and no discrete-GPU performance claim is made.

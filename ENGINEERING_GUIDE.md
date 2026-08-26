@@ -180,6 +180,8 @@ prompt_budget = native_context - reserved_output - safety_margin
 
 Use rolling windows, structured summaries, selective retrieval, and validated prefix reuse. Compression improves conversation continuity but does not change the model’s native context limit. Preserve system/developer instructions, constraints, decisions, identifiers, tool results, citations, and unresolved work.
 
+The narrow native attention contract is explicit: `attention_window=0` attends to all causal KV tokens; a positive value attends only to the last N tokens, including the current token, and reads that bounded range from the page. `rope_scale=0` or `1` preserves absolute positions; a positive value divides the absolute position before the standard RoPE rotation. This is a linear position policy, not NTK or dynamic scaling. `prefill_chunk_tokens=0` retains the existing sequential prompt loop; a positive value groups that same loop into bounded chunks without changing KV ownership or enabling cross-request interleaving.
+
 KV quantization is an explicit codec policy. Begin with FP16/BF16, then Q8/Q6, and only then experimental Q4, KIVI-like, or TurboQuant-like codecs. Each codec declares its bit rate, scale metadata, encode/decode cost, supported kernels, error metric, and model/backend restrictions.
 
 ## 10. CPU and Vulkan execution

@@ -1156,9 +1156,34 @@ static void test_native_mlp_profile() {
     assert(lm_model_execute_native_attention(model, &graph, &attention, attention_input, kv, page,
                                               scratch, sizeof(scratch), attention_output) == LM_OK);
     assert(std::fabs(attention_output[0] - (1.0f + 4096.0f * attention_scale)) < 1.0e-2f);
+    float manual_key[hidden / 2u] = {};
+    float manual_value[hidden / 2u] = {};
+    float current_key[hidden / 2u] = {};
+    float current_value[hidden / 2u] = {};
+    assert(lm_kv_cache_read_payload(kv, page, 1u, 1u, current_key, current_value) == LM_OK);
+    std::memcpy(manual_key, current_key, sizeof(manual_key));
+    for (float &value : manual_value) value = 100.0f;
+    assert(lm_kv_cache_write_payload(kv, page, 0u, 1u, manual_key, manual_value) == LM_OK);
+    attention.attention_window = 0u;
+    std::fill(attention_output, attention_output + hidden, 0.0f);
+    assert(lm_model_execute_native_attention(model, &graph, &attention, attention_input, kv, page,
+                                              scratch, sizeof(scratch), attention_output) == LM_OK);
+    const float full_attention_first = attention_output[0];
+    attention.attention_window = 1u;
+    std::fill(attention_output, attention_output + hidden, 0.0f);
+    assert(lm_model_execute_native_attention(model, &graph, &attention, attention_input, kv, page,
+                                              scratch, sizeof(scratch), attention_output) == LM_OK);
+    assert(std::fabs(attention_output[0] - full_attention_first) > 1.0e-3f);
+    attention.rope_scale = 2.0f;
+    assert(lm_model_execute_native_attention(model, &graph, &attention, attention_input, kv, page,
+                                              scratch, sizeof(scratch), attention_output) == LM_OK);
+    attention.rope_scale = -1.0f;
+    assert(lm_model_execute_native_attention(model, &graph, &attention, attention_input, kv, page,
+                                              scratch, sizeof(scratch), attention_output) == LM_ERR_ARGUMENT);
     uint32_t devices = 0u;
     assert(lm_vulkan_device_count(&devices) == LM_OK || devices == 0u);
     if (devices != 0u) {
+        attention.rope_scale = 0.0f;
         lm_native_attention_config vulkan_attention = attention;
         vulkan_attention.matvec = {LM_BACKEND_VULKAN, 0u, "matvec_q8_0_f32.comp.spv", nullptr};
         float vulkan_attention_output[hidden] = {};
@@ -1200,6 +1225,14 @@ static void test_native_mlp_profile() {
     assert(lm_model_generate_native(model, &graph, &generation, prompt, 2u, scratch,
                                     sizeof(scratch), generated, 3u, &generated_count) == LM_OK);
     assert(generated_count == 3u && generated[0] == 1u && generated[1] == 1u && generated[2] == 1u);
+    uint32_t chunked_generated[3] = {};
+    size_t chunked_count = 0u;
+    generation.prefill_chunk_tokens = 1u;
+    assert(lm_model_generate_native(model, &graph, &generation, prompt, 2u, scratch,
+                                    sizeof(scratch), chunked_generated, 3u, &chunked_count) == LM_OK);
+    assert(chunked_count == generated_count &&
+           std::memcmp(chunked_generated, generated, chunked_count * sizeof(uint32_t)) == 0);
+    generation.prefill_chunk_tokens = 0u;
     generation.has_stop_token = 1u;
     generation.stop_token = 1u;
     assert(lm_model_generate_native(model, &graph, &generation, prompt, 2u, scratch,

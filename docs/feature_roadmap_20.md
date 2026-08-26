@@ -8,9 +8,9 @@ The feature selection is informed by PagedAttention [1], EAGLE-2 dynamic draft t
 
 ## Current implementation status
 
-The current expansion tranche implements and tests the following policy primitives: advanced sampling and penalties (features 1–3), stop-string suppression (feature 4), caller-owned logits processors suitable for token masks (feature 5), deterministic n-gram proposal, greedy target verification, and adaptive depth (features 6–8), identity-safe longest-prefix lookup with LRU eviction (features 9–10), and a bounded fair round-robin batch scheduler with admission, cancellation, completion, and telemetry (feature 14). These are real library contracts with deterministic unit tests; speculative verification is not yet wired into target-model KV execution, and the batch scheduler callback is not itself a model executor.
+The current expansion tranche implements and tests the following policy primitives: advanced sampling and penalties (features 1–3), stop-string suppression (feature 4), caller-owned logits processors suitable for token masks (feature 5), deterministic n-gram proposal, greedy target verification, and adaptive depth (features 6–8), identity-safe longest-prefix lookup with LRU eviction (features 9–10), a bounded fair round-robin batch scheduler with admission, cancellation, completion, and telemetry (feature 14), and a native CPU sliding-window attention plus explicit linear RoPE position-scale slice (features 12 and 16). These are real library contracts with deterministic unit tests; speculative verification is not yet wired into target-model KV execution, the prefix table is not a KV-page owner, and the batch scheduler callback is not itself a model executor.
 
-The remaining roadmap items remain explicitly planned rather than silently advertised as complete. Each will require a vertical slice with a CPU oracle, backend differential tests where applicable, and real-model evidence before its status changes.
+The remaining roadmap items remain explicitly planned rather than silently advertised as complete. Features marked as bounded slices are not claims of full serving integration; each broader extension still requires a CPU oracle, backend differential tests where applicable, and real-model evidence before its status changes.
 
 ## Twenty useful features
 
@@ -27,11 +27,11 @@ The remaining roadmap items remain explicitly planned rather than silently adver
 | 9 | Prefix KV cache | Hash token prefixes plus model/settings identity and reuse committed full pages. | Same-prefix reuse, mismatch invalidation, COW isolation. | P0 |
 | 10 | KV eviction and tiering | Add LRU metadata and explicit host/device/disk residency transitions. | Budget pressure, pinning, readback equality, failure reporting. | P1 |
 | 11 | Context shifting | Preserve a configured prefix while rolling the conversation tail when the context window fills. | Long prompt generation and token-position checks. | P0 |
-| 12 | Sliding-window attention | Honor architecture/request window limits without reading discarded KV pages. | Windowed attention oracle and page-read bounds. | P1 |
-| 13 | Chunked prefill | Split long prompts into bounded work units and interleave decode work. | Token/logit equality against unchunked prefill. | P0 |
+| 12 | Sliding-window attention | Honor an explicit request window: `0` means all causal KV; nonzero means only the last N cached tokens, read as a bounded contiguous range. | Windowed attention oracle and cache-range differential test. | P1; native CPU slice implemented |
+| 13 | Chunked prefill | Split long prompts into bounded sequential work units while preserving KV/logit continuity. Interleaving with other requests remains a scheduler concern. | Token/logit equality against unchunked prefill. | P0; bounded native sequential slice implemented |
 | 14 | Continuous batching | Admit, pause, compact, and retire requests at decode-step boundaries. | Two-request deterministic batch versus serial oracle. | P0; bounded scheduler primitive implemented, model integration pending |
 | 15 | Prompt-cache serialization | Export/import validated prefix metadata and native KV payloads with model identity checks. | Round trip, corruption rejection, incompatible model rejection. | P1 |
-| 16 | RoPE context extension | Add explicit linear/NTK-style scaling policy fields with architecture validation. | Position-frequency oracle and unsupported-policy tests. | P1 |
+| 16 | RoPE context extension | Add an explicit linear position policy: `rope_scale=0` or `1` leaves positions unchanged; positive values divide absolute positions by that scale. | Finite/invalid policy tests and position-frequency oracle. | P1; explicit linear CPU slice implemented; NTK/dynamic policies unsupported |
 | 17 | Mixed per-layer KV precision | Select codecs by layer/head policy instead of one global KV dtype. | Codec round trips and attention differential tests. | P1 |
 | 18 | Structured decoding masks | Add choice, stop/allowed-token, and bounded JSON-prefix constraints through the logits processor. | Exact token-mask fixtures and malformed policy rejection. | P1 |
 | 19 | Backend autotuning and telemetry | Benchmark registered kernel paths at startup or on demand and report choice, latency, bytes, and fallback reason. | Deterministic mock-capability probe plus real llvmpipe report. | P1 |
@@ -43,7 +43,7 @@ Learned EAGLE/MLP/MTP heads, arbitrary sparse attention, semantic KV autoencoder
 
 ## Implementation order
 
-The first implementation tranche should be features 1–9 and 11–14 because they build directly on existing sampling, page/COW KV, context-compaction, native generation, and batch foundations. The second tranche should implement 10, 15–19. Feature 20 should begin with validation-only partition and transfer contracts before any network or vendor transport is added.
+The first implementation tranche should be features 1–9 and 11–14 because they build directly on existing sampling, page/COW KV, context-compaction, native generation, and batch foundations; features 12 and 16 now have narrow CPU vertical slices. The second tranche should implement 10, 13, 15, and 17–19. Feature 20 should begin with validation-only partition and transfer contracts before any network or vendor transport is added.
 
 ## References
 
