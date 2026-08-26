@@ -1114,6 +1114,107 @@ static void test_native_mlp_profile() {
     std::remove(path);
 }
 
+static void test_model_shard_binding() {
+    const char *paths[2] = {"test-split-00001-of-00002.gguf", "test-split-00002-of-00002.gguf"};
+    auto write_shard = [](const char *path, uint16_t shard_no, const char *name, unsigned char fill, bool include_tensor_count = true) {
+        std::vector<unsigned char> bytes(24u, 0u);
+        bytes[0] = 'G'; bytes[1] = 'G'; bytes[2] = 'U'; bytes[3] = 'F';
+        bytes[4] = 3u; bytes[8] = 1u; bytes[16] = 3u;
+        auto put_u16 = [&bytes](uint16_t value) { bytes.push_back(static_cast<unsigned char>(value & 0xffu)); bytes.push_back(static_cast<unsigned char>(value >> 8u)); };
+        auto put_u32 = [&bytes](uint32_t value) { for (unsigned i = 0u; i < 4u; ++i) bytes.push_back(static_cast<unsigned char>((value >> (8u * i)) & 0xffu)); };
+        auto put_u64 = [&bytes](uint64_t value) { for (unsigned i = 0u; i < 8u; ++i) bytes.push_back(static_cast<unsigned char>((value >> (8u * i)) & 0xffu)); };
+        auto put_string = [&bytes, &put_u64](const char *value) { const size_t n = std::strlen(value); put_u64(n); bytes.insert(bytes.end(), value, value + n); };
+        auto put_u16_key = [&put_string, &put_u32, &put_u16](const char *key, uint16_t value) { put_string(key); put_u32(2u); put_u16(value); };
+        auto put_u32_key = [&put_string, &put_u32](const char *key, uint32_t value) { put_string(key); put_u32(4u); put_u32(value); };
+        put_u16_key("split.count", 2u);
+        put_u16_key("split.no", shard_no);
+        if (include_tensor_count) put_u32_key("split.tensors.count", 2u);
+        put_string(name); put_u32(2u); put_u64(1u); put_u64(32u); put_u32(8u); put_u64(0u);
+        bytes.resize((bytes.size() + 31u) & ~static_cast<size_t>(31u), 0u);
+        bytes.resize(bytes.size() + 34u, fill);
+        bytes[bytes.size() - 34u] = 0u; bytes[bytes.size() - 33u] = 0x3cu;
+        std::ofstream file(path, std::ios::binary);
+        file.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    write_shard(paths[0], 0u, "x0", 1u);
+    write_shard(paths[1], 1u, "x1", 2u);
+    char error[128] = {};
+    lm_model_file *model = nullptr;
+    const lm_status split_opened = lm_model_open_sharded(paths, 2u, &model, error, sizeof(error));
+    assert(split_opened == LM_OK);
+    lm_model_info info{};
+    assert(lm_model_get_info(model, &info) == LM_OK && info.tensor_count == 2u);
+    lm_model_tensor_info descriptor{};
+    assert(lm_model_tensor_info_at(model, 1u, &descriptor) == LM_OK && descriptor.shard_index == 1u);
+    lm_model_tensor_binding binding{};
+    assert(lm_model_tensor_bind_native(model, 1u, &binding) == LM_OK);
+    lm_file_span ambiguous_span{};
+    assert(lm_model_tensor_span(model, 0u, 34u, &ambiguous_span) == LM_ERR_UNSUPPORTED);
+    unsigned char payload[34] = {};
+    lm_tensor tensor{};
+    assert(lm_model_tensor_binding_read(&binding, payload, sizeof(payload), &tensor) == LM_OK);
+    assert(payload[2] == 2u && payload[33] == 2u);
+    const float input[32] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+                             1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+                             1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+                             1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    lm_native_matvec_config native_cpu{LM_BACKEND_CPU, 0u, nullptr, nullptr};
+    float cpu_output[1] = {};
+    unsigned char scratch[34] = {};
+    assert(lm_model_tensor_matvec_native(model, 1u, &native_cpu, scratch, sizeof(scratch),
+                                         1u, 32u, input, cpu_output) == LM_OK);
+    assert(cpu_output[0] == 64.0f);
+    uint32_t devices = 0u;
+    if (lm_vulkan_device_count(&devices) == LM_OK && devices != 0u) {
+        lm_native_matvec_config native_vulkan{LM_BACKEND_VULKAN, 0u, "matvec_q8_0_f32.comp.spv", nullptr};
+        float vulkan_output[1] = {};
+        assert(lm_model_tensor_matvec_native(model, 1u, &native_vulkan, scratch, sizeof(scratch),
+                                             1u, 32u, input, vulkan_output) == LM_OK);
+        assert(vulkan_output[0] == cpu_output[0]);
+    }
+    lm_model_close(model);
+    const char *missing_paths[2] = {paths[0], "missing-split.gguf"};
+    assert(lm_model_open_sharded(missing_paths, 2u, &model, error, sizeof(error)) == LM_ERR_IO);
+    const char *reversed_paths[2] = {paths[1], paths[0]};
+    assert(lm_model_open_sharded(reversed_paths, 2u, &model, error, sizeof(error)) == LM_ERR_PARSE);
+    write_shard(paths[1], 1u, "x1", 2u, false);
+    assert(lm_model_open_sharded(paths, 2u, &model, error, sizeof(error)) == LM_ERR_PARSE);
+    write_shard(paths[1], 1u, "x0", 2u);
+    assert(lm_model_open_sharded(paths, 2u, &model, error, sizeof(error)) == LM_ERR_PARSE);
+    std::remove(paths[0]); std::remove(paths[1]);
+}
+
+static void test_safetensors_shard_binding() {
+    const char *paths[2] = {"test-safe-00001-of-00002.safetensors", "test-safe-00002-of-00002.safetensors"};
+    auto write_shard = [](const char *path, const char *name, float first, float second) {
+        const std::string json = std::string("{\"") + name + "\":{\"dtype\":\"F32\",\"shape\":[1,2],\"data_offsets\":[0,8]}}";
+        std::ofstream file(path, std::ios::binary);
+        const uint64_t header_bytes = json.size();
+        file.write(reinterpret_cast<const char *>(&header_bytes), sizeof(header_bytes));
+        file.write(json.data(), static_cast<std::streamsize>(json.size()));
+        const float values[2] = {first, second};
+        file.write(reinterpret_cast<const char *>(values), sizeof(values));
+    };
+    write_shard(paths[0], "x0", 1.0f, 2.0f);
+    write_shard(paths[1], "x1", 3.0f, 4.0f);
+    char error[128] = {};
+    lm_model_file *model = nullptr;
+    assert(lm_model_open_sharded(paths, 2u, &model, error, sizeof(error)) == LM_OK);
+    lm_model_tensor_info descriptor{};
+    assert(lm_model_tensor_info_at(model, 1u, &descriptor) == LM_OK && descriptor.shard_index == 1u);
+    float scratch[2] = {};
+    const float input[2] = {1.0f, 1.0f};
+    float output[1] = {};
+    assert(lm_model_tensor_matvec_f32_cpu(model, 1u, scratch, sizeof(scratch), 1u, 2u, input, output) == LM_OK);
+    assert(output[0] == 7.0f);
+    lm_file_span ambiguous{};
+    assert(lm_model_tensor_span(model, 0u, 8u, &ambiguous) == LM_ERR_UNSUPPORTED);
+    lm_model_close(model);
+    write_shard(paths[1], "x0", 3.0f, 4.0f);
+    assert(lm_model_open_sharded(paths, 2u, &model, error, sizeof(error)) == LM_ERR_PARSE);
+    std::remove(paths[0]); std::remove(paths[1]);
+}
+
 static void test_model_and_cpu_math() {
     const char *gguf = "test-fixture.gguf";
     {
@@ -1573,6 +1674,53 @@ static void test_kv_payload() {
                                            UINT32_MAX, &invalid) == LM_ERR_CAPACITY);
 }
 
+static void test_kv_typed_codecs() {
+    const lm_kv_dtype dtypes[] = {LM_KV_F16, LM_KV_BF16, LM_KV_Q8, LM_KV_Q6, LM_KV_Q4};
+    const float tolerances[] = {1.0e-3f, 1.0e-2f, 2.0e-2f, 1.0e-1f, 2.5e-1f};
+    const uint32_t expected_bytes[] = {64u, 64u, 36u, 28u, 20u};
+    for (size_t kind = 0u; kind < sizeof(dtypes) / sizeof(dtypes[0]); ++kind) {
+        lm_kv_cache *cache = nullptr;
+        assert(lm_kv_cache_create_typed(2u, 2u, dtypes[kind], 32u, 32u, &cache) == LM_OK);
+        uint32_t page = UINT32_MAX;
+        assert(lm_kv_cache_append(cache, &page, 2u) == LM_OK);
+        uint32_t key_bytes = 0u, value_bytes = 0u;
+        assert(lm_kv_cache_get_payload_layout(cache, &key_bytes, &value_bytes) == LM_OK &&
+               key_bytes == expected_bytes[kind] && value_bytes == expected_bytes[kind]);
+        std::vector<float> keys(64u), values(64u), decoded_keys(64u), decoded_values(64u);
+        for (size_t i = 0u; i < keys.size(); ++i) {
+            keys[i] = -1.75f + static_cast<float>(i) * 0.03125f;
+            values[i] = 0.5f - static_cast<float>(i) * 0.0625f;
+        }
+        assert(lm_kv_cache_write_f32(cache, page, 0u, 2u, keys.data(), values.data()) == LM_OK);
+        assert(lm_kv_cache_read_f32(cache, page, 0u, 2u, decoded_keys.data(), decoded_values.data()) == LM_OK);
+        for (size_t i = 0u; i < keys.size(); ++i) {
+            assert(std::isfinite(decoded_keys[i]) && std::isfinite(decoded_values[i]));
+            assert(std::fabs(decoded_keys[i] - keys[i]) <= tolerances[kind]);
+            assert(std::fabs(decoded_values[i] - values[i]) <= tolerances[kind]);
+        }
+        uint32_t child = UINT32_MAX;
+        assert(lm_kv_cache_fork(cache, page, &child) == LM_OK);
+        float child_key[32] = {}, child_value[32] = {};
+        for (unsigned i = 0u; i < 32u; ++i) { child_key[i] = 1.0f; child_value[i] = -1.0f; }
+        assert(lm_kv_cache_write_f32(cache, child, 1u, 1u, child_key, child_value) == LM_OK);
+        assert(lm_kv_cache_read_f32(cache, page, 1u, 1u, decoded_keys.data(), decoded_values.data()) == LM_OK);
+        assert(std::fabs(decoded_keys[0] - keys[32]) <= tolerances[kind]);
+        assert(std::fabs(decoded_values[0] - values[32]) <= tolerances[kind]);
+        assert(lm_kv_cache_read_f32(cache, child, 1u, 1u, decoded_keys.data(), decoded_values.data()) == LM_OK);
+        assert(std::fabs(decoded_keys[0] - 1.0f) <= tolerances[kind]);
+        assert(std::fabs(decoded_values[0] + 1.0f) <= tolerances[kind]);
+        std::vector<float> bad(32u, std::numeric_limits<float>::quiet_NaN());
+        assert(lm_kv_cache_write_f32(cache, page, 0u, 1u, bad.data(), child_value) == LM_ERR_RANGE);
+        assert(lm_kv_cache_release(cache, page) == LM_OK && lm_kv_cache_release(cache, child) == LM_OK);
+        lm_kv_cache_destroy(cache);
+    }
+    lm_kv_cache *opaque = nullptr;
+    assert(lm_kv_cache_create_with_payload(1u, 1u, 64u, 64u, &opaque) == LM_OK);
+    float values[32] = {};
+    assert(lm_kv_cache_write_f32(opaque, 0u, 0u, 1u, values, values) == LM_ERR_UNSUPPORTED);
+    lm_kv_cache_destroy(opaque);
+}
+
 static void test_kernel_selection() {
     lm_kernel_caps cpu{0u, 0u, 0u};
     lm_kernel_choice choice{};
@@ -1723,6 +1871,8 @@ int main() {
     test_native_model_tensor_binding();
     test_model_bound_moe_q4_k();
     test_native_mlp_profile();
+    test_model_shard_binding();
+    test_safetensors_shard_binding();
     test_model_and_cpu_math();
     test_safetensors_parser();
     test_safetensors_native_mlp();
@@ -1733,6 +1883,7 @@ int main() {
     test_moe_router();
     test_kv_pages();
     test_kv_payload();
+    test_kv_typed_codecs();
     test_kernel_selection();
     test_vulkan_dp4();
     test_probe_and_runtime();

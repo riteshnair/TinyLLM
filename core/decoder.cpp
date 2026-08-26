@@ -171,7 +171,7 @@ lm_status profile_vector(const lm_model_file *model, uint64_t index, uint32_t el
         return LM_ERR_UNSUPPORTED;
     const uint64_t bytes = static_cast<uint64_t>(elements) * sizeof(float);
     lm_file_span span{};
-    const lm_status spanned = lm_model_tensor_span(model, descriptor.relative_offset, bytes, &span);
+    const lm_status spanned = lm_model_tensor_span_at(model, index, bytes, &span);
     if (spanned != LM_OK) return spanned;
     try {
         out->assign(elements, 0.0f);
@@ -200,7 +200,7 @@ lm_status profile_matvec(const lm_model_file *model, uint64_t index,
         if (bytes > packed_scratch_bytes || bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) return LM_ERR_CAPACITY;
         if (config->backend == LM_BACKEND_VULKAN) {
             lm_file_span span{};
-            lm_status status = lm_model_tensor_span(model, descriptor.relative_offset, bytes, &span);
+            lm_status status = lm_model_tensor_span_at(model, index, bytes, &span);
             if (status != LM_OK) return status;
             status = lm_file_span_read(&span, 0u, packed_scratch, static_cast<size_t>(bytes));
             if (status != LM_OK) return status;

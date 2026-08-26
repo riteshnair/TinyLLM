@@ -121,6 +121,9 @@ typedef struct lm_file_shard_set lm_file_shard_set;
 lm_status lm_file_shard_set_open(const char *const *paths, size_t count, lm_file_shard_set **out_set);
 void lm_file_shard_set_close(lm_file_shard_set *set);
 lm_status lm_file_shard_set_size(const lm_file_shard_set *set, uint64_t *out_bytes);
+lm_status lm_file_shard_set_count(const lm_file_shard_set *set, size_t *out_count);
+lm_status lm_file_shard_set_span(lm_file_shard_set *set, size_t shard, uint64_t offset,
+                                  uint64_t bytes, lm_file_span *out_span);
 lm_status lm_file_shard_set_read(lm_file_shard_set *set, uint64_t offset, void *dst, size_t bytes);
 
 
@@ -327,6 +330,7 @@ typedef struct lm_model_tensor_info {
     uint64_t dims[8];
     uint32_t type;
     uint64_t relative_offset;
+    uint32_t shard_index;
 } lm_model_tensor_info;
 
 typedef struct lm_model_tensor_binding {
@@ -346,6 +350,11 @@ typedef struct lm_native_matvec_config {
 } lm_native_matvec_config;
 
 lm_status lm_model_open(const char *path, lm_model_file **out_model, char *error_text, size_t error_capacity);
+/* Opens an ordered GGUF split set or explicit SafeTensors file set. The model owns all
+ * file handles; tensor payloads remain in their native files and are never concatenated. */
+lm_status lm_model_open_sharded(const char *const *paths, size_t path_count,
+                                lm_model_file **out_model, char *error_text,
+                                size_t error_capacity);
 void lm_model_close(lm_model_file *model);
 lm_status lm_model_get_info(const lm_model_file *model, lm_model_info *out_info);
 lm_status lm_model_get_architecture(const lm_model_file *model, lm_model_architecture *out_architecture);
@@ -359,7 +368,11 @@ lm_status lm_model_token_encode(const lm_model_file *model, const char *text,
 lm_status lm_model_token_decode(const lm_model_file *model, const uint32_t *tokens,
                                 size_t token_count, char *out_text,
                                 size_t out_capacity, size_t *out_bytes);
+/* Single-file compatibility lookup. Returns LM_ERR_UNSUPPORTED for a sharded model;
+ * use lm_model_tensor_span_at so the owning file header is applied. */
 lm_status lm_model_tensor_span(const lm_model_file *model, uint64_t relative_offset, uint64_t bytes, lm_file_span *out_span);
+/* Resolves a tensor index against its owning shard and returns a non-owning validated span. */
+lm_status lm_model_tensor_span_at(const lm_model_file *model, uint64_t index, uint64_t bytes, lm_file_span *out_span);
 lm_status lm_model_tensor_bind_native(const lm_model_file *model, uint64_t index, lm_model_tensor_binding *out_binding);
 lm_status lm_model_tensor_binding_view(const lm_model_tensor_binding *binding, void *data, uint64_t bytes, lm_tensor *out_tensor);
 lm_status lm_model_tensor_binding_read(const lm_model_tensor_binding *binding, void *data, uint64_t bytes, lm_tensor *out_tensor);
@@ -798,6 +811,11 @@ lm_status lm_kv_cache_create_with_payload(uint32_t page_count, uint32_t page_tok
                                           uint32_t key_bytes_per_token,
                                           uint32_t value_bytes_per_token,
                                           lm_kv_cache **out_cache);
+/* Creates a page cache whose per-token payload is encoded by the named CPU codec.
+ * F32 callers use lm_kv_cache_write_f32/read_f32; encoded bytes remain page-local. */
+lm_status lm_kv_cache_create_typed(uint32_t page_count, uint32_t page_tokens,
+                                   lm_kv_dtype dtype, uint32_t key_elements_per_token,
+                                   uint32_t value_elements_per_token, lm_kv_cache **out_cache);
 void lm_kv_cache_destroy(lm_kv_cache *cache);
 lm_status lm_kv_cache_append(lm_kv_cache *cache, uint32_t *page_id,
                              uint32_t token_count);
@@ -819,6 +837,13 @@ lm_status lm_kv_cache_write_payload(lm_kv_cache *cache, uint32_t page_id,
 lm_status lm_kv_cache_read_payload(const lm_kv_cache *cache, uint32_t page_id,
                                     uint32_t token_offset, uint32_t token_count,
                                     void *keys, void *values);
+/* Encodes/decodes already-appended tokens; invalid numeric input leaves shared pages unchanged. */
+lm_status lm_kv_cache_write_f32(lm_kv_cache *cache, uint32_t page_id,
+                                uint32_t token_offset, uint32_t token_count,
+                                const float *keys, const float *values);
+lm_status lm_kv_cache_read_f32(const lm_kv_cache *cache, uint32_t page_id,
+                               uint32_t token_offset, uint32_t token_count,
+                               float *keys, float *values);
 
 lm_status lm_runtime_create(const lm_config *config, lm_runtime **out_runtime);
 void lm_runtime_destroy(lm_runtime *runtime);

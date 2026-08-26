@@ -223,6 +223,19 @@ lm_status lm_file_shard_set_size(const lm_file_shard_set *set, uint64_t *out_byt
     return LM_OK;
 }
 
+lm_status lm_file_shard_set_count(const lm_file_shard_set *set, size_t *out_count) {
+    if (!set || !out_count) return LM_ERR_ARGUMENT;
+    *out_count = set->files.size();
+    return LM_OK;
+}
+
+lm_status lm_file_shard_set_span(lm_file_shard_set *set, size_t shard, uint64_t offset,
+                                  uint64_t bytes, lm_file_span *out_span) {
+    if (!set || !out_span) return LM_ERR_ARGUMENT;
+    if (shard >= set->files.size()) return LM_ERR_RANGE;
+    return lm_file_span_make(set->files[shard], offset, bytes, out_span);
+}
+
 lm_status lm_file_shard_set_read(lm_file_shard_set *set, uint64_t offset, void *dst, size_t bytes) {
     if (!set || (!dst && bytes != 0u)) return LM_ERR_ARGUMENT;
     if (offset > set->bytes || static_cast<uint64_t>(bytes) > set->bytes - offset) return LM_ERR_RANGE;

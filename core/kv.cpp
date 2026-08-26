@@ -3,6 +3,105 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <cmath>
+#include <cstdint>
+#include <algorithm>
+
+static uint16_t float_to_f16(float value) {
+    uint32_t bits = 0u; std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = (bits >> 16u) & 0x8000u;
+    int exponent = static_cast<int>((bits >> 23u) & 0xffu) - 127 + 15;
+    uint32_t mantissa = bits & 0x7fffffu;
+    if (exponent <= 0) return static_cast<uint16_t>(sign);
+    if (exponent >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+    mantissa += 0x1000u;
+    if ((mantissa & 0x800000u) != 0u) { mantissa = 0u; ++exponent; }
+    return exponent >= 31 ? static_cast<uint16_t>(sign | 0x7c00u) :
+           static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10u) | (mantissa >> 13u));
+}
+
+static float f16_to_float(uint16_t value) {
+    const uint32_t sign = static_cast<uint32_t>(value & 0x8000u) << 16u;
+    const uint32_t exponent = (value >> 10u) & 31u;
+    const uint32_t mantissa = value & 0x3ffu;
+    uint32_t bits = sign;
+    if (exponent == 0u) bits = mantissa == 0u ? sign : sign | ((static_cast<uint32_t>(127 - 15 + 1)) << 23u) | (mantissa << 13u);
+    else if (exponent == 31u) bits = sign | 0x7f800000u | (mantissa << 13u);
+    else bits = sign | ((exponent + 127u - 15u) << 23u) | (mantissa << 13u);
+    float result = 0.0f; std::memcpy(&result, &bits, sizeof(result)); return result;
+}
+
+static uint32_t kv_codec_bytes(lm_kv_dtype dtype, uint32_t elements) {
+    if (elements == 0u) return 0u;
+    const uint64_t blocks = (static_cast<uint64_t>(elements) + 31u) / 32u;
+    uint64_t bytes = 0u;
+    if (dtype == LM_KV_F16 || dtype == LM_KV_BF16) bytes = static_cast<uint64_t>(elements) * 2u;
+    else if (dtype == LM_KV_Q8) bytes = blocks * 36u;
+    else if (dtype == LM_KV_Q6) bytes = blocks * 28u;
+    else if (dtype == LM_KV_Q4) bytes = blocks * 20u;
+    return bytes > UINT32_MAX ? 0u : static_cast<uint32_t>(bytes);
+}
+
+static lm_status kv_codec_write(const float *input, uint32_t elements, lm_kv_dtype dtype, void *output, uint32_t bytes) {
+    if (!input || !output || kv_codec_bytes(dtype, elements) != bytes) return LM_ERR_ARGUMENT;
+    for (uint32_t i = 0u; i < elements; ++i) if (!std::isfinite(input[i])) return LM_ERR_RANGE;
+    if (dtype == LM_KV_F16) {
+        uint16_t *dst = static_cast<uint16_t *>(output);
+        for (uint32_t i = 0u; i < elements; ++i) dst[i] = float_to_f16(input[i]);
+        return LM_OK;
+    }
+    if (dtype == LM_KV_BF16) {
+        uint16_t *dst = static_cast<uint16_t *>(output);
+        for (uint32_t i = 0u; i < elements; ++i) { uint32_t bits = 0u; std::memcpy(&bits, input + i, sizeof(bits)); dst[i] = static_cast<uint16_t>((bits + 0x8000u) >> 16u); }
+        return LM_OK;
+    }
+    const uint32_t packed_bytes = dtype == LM_KV_Q8 ? 32u : dtype == LM_KV_Q6 ? 24u : 16u;
+    const int max_value = dtype == LM_KV_Q8 ? 127 : dtype == LM_KV_Q6 ? 31 : 7;
+    const int quant_offset = dtype == LM_KV_Q6 ? 32 : dtype == LM_KV_Q4 ? 8 : 0;
+    const uint32_t blocks = (elements + 31u) / 32u;
+    unsigned char *dst = static_cast<unsigned char *>(output);
+    for (uint32_t block = 0u; block < blocks; ++block) {
+        const uint32_t begin = block * 32u;
+        const uint32_t count = elements - begin < 32u ? elements - begin : 32u;
+        float maximum = 0.0f;
+        for (uint32_t i = 0u; i < count; ++i) maximum = std::max(maximum, std::fabs(input[begin + i]));
+        const float scale = maximum > 0.0f ? maximum / static_cast<float>(max_value) : 1.0f;
+        std::memcpy(dst + block * (4u + packed_bytes), &scale, sizeof(scale));
+        std::memset(dst + block * (4u + packed_bytes) + 4u, 0, packed_bytes);
+        for (uint32_t i = 0u; i < count; ++i) {
+            int quantized = static_cast<int>(std::lrint(input[begin + i] / scale));
+            quantized = std::max(-max_value, std::min(max_value, quantized));
+            const uint32_t stored = static_cast<uint32_t>(quantized + quant_offset);
+            if (dtype == LM_KV_Q8) static_cast<int8_t *>(static_cast<void *>(dst + block * 36u + 4u))[i] = static_cast<int8_t>(quantized);
+            else for (uint32_t bit = 0u; bit < (dtype == LM_KV_Q6 ? 6u : 4u); ++bit) if ((stored & (1u << bit)) != 0u) {
+                const uint32_t position = i * (dtype == LM_KV_Q6 ? 6u : 4u) + bit;
+                dst[block * (4u + packed_bytes) + 4u + position / 8u] |= static_cast<unsigned char>(1u << (position % 8u));
+            }
+        }
+    }
+    return LM_OK;
+}
+
+static lm_status kv_codec_read(const void *input, uint32_t elements, lm_kv_dtype dtype, uint32_t bytes, float *output) {
+    if (!input || !output || kv_codec_bytes(dtype, elements) != bytes) return LM_ERR_ARGUMENT;
+    if (dtype == LM_KV_F16) { const uint16_t *src = static_cast<const uint16_t *>(input); for (uint32_t i = 0u; i < elements; ++i) output[i] = f16_to_float(src[i]); return LM_OK; }
+    if (dtype == LM_KV_BF16) { const uint16_t *src = static_cast<const uint16_t *>(input); for (uint32_t i = 0u; i < elements; ++i) { uint32_t bits = static_cast<uint32_t>(src[i]) << 16u; std::memcpy(output + i, &bits, sizeof(bits)); } return LM_OK; }
+    const uint32_t packed_bytes = dtype == LM_KV_Q8 ? 32u : dtype == LM_KV_Q6 ? 24u : 16u;
+    const int quant_offset = dtype == LM_KV_Q6 ? 32 : dtype == LM_KV_Q4 ? 8 : 0;
+    const uint32_t bits_per_value = dtype == LM_KV_Q6 ? 6u : 4u;
+    const unsigned char *src = static_cast<const unsigned char *>(input);
+    for (uint32_t block = 0u; block < (elements + 31u) / 32u; ++block) {
+        float scale = 1.0f; std::memcpy(&scale, src + block * (4u + packed_bytes), sizeof(scale));
+        const uint32_t count = elements - block * 32u < 32u ? elements - block * 32u : 32u;
+        for (uint32_t i = 0u; i < count; ++i) {
+            int quantized = 0;
+            if (dtype == LM_KV_Q8) quantized = static_cast<int>(static_cast<const int8_t *>(static_cast<const void *>(src + block * 36u + 4u))[i]);
+            else { uint32_t stored = 0u; for (uint32_t bit = 0u; bit < bits_per_value; ++bit) { const uint32_t position = i * bits_per_value + bit; if ((src[block * (4u + packed_bytes) + 4u + position / 8u] & (1u << (position % 8u))) != 0u) stored |= 1u << bit; } quantized = static_cast<int>(stored) - quant_offset; }
+            output[block * 32u + i] = static_cast<float>(quantized) * scale;
+        }
+    }
+    return LM_OK;
+}
 
 struct lm_kv_storage {
     uint32_t tokens;
@@ -24,6 +123,10 @@ struct lm_kv_cache {
     uint32_t free_storages;
     uint32_t key_bytes_per_token;
     uint32_t value_bytes_per_token;
+    lm_kv_dtype dtype;
+    uint32_t key_elements_per_token;
+    uint32_t value_elements_per_token;
+    uint8_t typed;
     uint64_t appended_tokens;
     lm_kv_page *pages;
     lm_kv_storage *storages;
@@ -129,6 +232,25 @@ lm_status lm_kv_cache_create_with_payload(uint32_t page_count, uint32_t page_tok
     cache->free_pages = page_count;
     cache->free_storages = page_count;
     *out_cache = cache;
+    return LM_OK;
+}
+
+lm_status lm_kv_cache_create_typed(uint32_t page_count, uint32_t page_tokens,
+                                   lm_kv_dtype dtype, uint32_t key_elements_per_token,
+                                   uint32_t value_elements_per_token, lm_kv_cache **out_cache) {
+    if (!out_cache || key_elements_per_token == 0u || value_elements_per_token == 0u ||
+        (dtype != LM_KV_F16 && dtype != LM_KV_BF16 && dtype != LM_KV_Q8 &&
+         dtype != LM_KV_Q6 && dtype != LM_KV_Q4)) return LM_ERR_ARGUMENT;
+    const uint32_t key_bytes = kv_codec_bytes(dtype, key_elements_per_token);
+    const uint32_t value_bytes = kv_codec_bytes(dtype, value_elements_per_token);
+    if (key_bytes == 0u || value_bytes == 0u) return LM_ERR_CAPACITY;
+    const lm_status created = lm_kv_cache_create_with_payload(page_count, page_tokens,
+                                                               key_bytes, value_bytes, out_cache);
+    if (created != LM_OK) return created;
+    (*out_cache)->dtype = dtype;
+    (*out_cache)->key_elements_per_token = key_elements_per_token;
+    (*out_cache)->value_elements_per_token = value_elements_per_token;
+    (*out_cache)->typed = 1u;
     return LM_OK;
 }
 
@@ -247,6 +369,62 @@ lm_status lm_kv_cache_read_payload(const lm_kv_cache *cache, uint32_t page_id,
     const size_t value_bytes = static_cast<size_t>(token_count) * cache->value_bytes_per_token;
     std::memcpy(keys, static_cast<const unsigned char *>(storage->key_payload) + key_offset, key_bytes);
     std::memcpy(values, static_cast<const unsigned char *>(storage->value_payload) + value_offset, value_bytes);
+    return LM_OK;
+}
+
+lm_status lm_kv_cache_write_f32(lm_kv_cache *cache, uint32_t page_id,
+                                uint32_t token_offset, uint32_t token_count,
+                                const float *keys, const float *values) {
+    if (!cache || !cache->typed || !keys || !values) return LM_ERR_UNSUPPORTED;
+    const lm_status valid = validate_payload_range(cache, page_id, token_offset, token_count);
+    if (valid != LM_OK) return valid;
+    if (token_count > UINT32_MAX / cache->key_elements_per_token || token_count > UINT32_MAX / cache->value_elements_per_token)
+        return LM_ERR_CAPACITY;
+    const size_t key_elements = static_cast<size_t>(token_count) * cache->key_elements_per_token;
+    const size_t value_elements = static_cast<size_t>(token_count) * cache->value_elements_per_token;
+    for (size_t i = 0u; i < key_elements; ++i) if (!std::isfinite(keys[i])) return LM_ERR_RANGE;
+    for (size_t i = 0u; i < value_elements; ++i) if (!std::isfinite(values[i])) return LM_ERR_RANGE;
+    const lm_status detached = detach_for_write(cache, page_id);
+    if (detached != LM_OK) return detached;
+    lm_kv_storage *storage = &cache->storages[cache->pages[page_id].storage_id];
+    unsigned char *key_dst = static_cast<unsigned char *>(storage->key_payload) + static_cast<size_t>(token_offset) * cache->key_bytes_per_token;
+    unsigned char *value_dst = static_cast<unsigned char *>(storage->value_payload) + static_cast<size_t>(token_offset) * cache->value_bytes_per_token;
+    for (uint32_t token = 0u; token < token_count; ++token) {
+        lm_status status = kv_codec_write(keys + static_cast<size_t>(token) * cache->key_elements_per_token,
+                                          cache->key_elements_per_token, cache->dtype,
+                                          key_dst + static_cast<size_t>(token) * cache->key_bytes_per_token,
+                                          cache->key_bytes_per_token);
+        if (status != LM_OK) return status;
+        status = kv_codec_write(values + static_cast<size_t>(token) * cache->value_elements_per_token,
+                                cache->value_elements_per_token, cache->dtype,
+                                value_dst + static_cast<size_t>(token) * cache->value_bytes_per_token,
+                                cache->value_bytes_per_token);
+        if (status != LM_OK) return status;
+    }
+    return LM_OK;
+}
+
+lm_status lm_kv_cache_read_f32(const lm_kv_cache *cache, uint32_t page_id,
+                               uint32_t token_offset, uint32_t token_count,
+                               float *keys, float *values) {
+    if (!cache || !cache->typed || !keys || !values) return LM_ERR_UNSUPPORTED;
+    const lm_status valid = validate_payload_range(cache, page_id, token_offset, token_count);
+    if (valid != LM_OK) return valid;
+    const lm_kv_storage *storage = &cache->storages[cache->pages[page_id].storage_id];
+    const unsigned char *key_src = static_cast<const unsigned char *>(storage->key_payload) + static_cast<size_t>(token_offset) * cache->key_bytes_per_token;
+    const unsigned char *value_src = static_cast<const unsigned char *>(storage->value_payload) + static_cast<size_t>(token_offset) * cache->value_bytes_per_token;
+    for (uint32_t token = 0u; token < token_count; ++token) {
+        lm_status status = kv_codec_read(key_src + static_cast<size_t>(token) * cache->key_bytes_per_token,
+                                         cache->key_elements_per_token, cache->dtype,
+                                         cache->key_bytes_per_token,
+                                         keys + static_cast<size_t>(token) * cache->key_elements_per_token);
+        if (status != LM_OK) return status;
+        status = kv_codec_read(value_src + static_cast<size_t>(token) * cache->value_bytes_per_token,
+                               cache->value_elements_per_token, cache->dtype,
+                               cache->value_bytes_per_token,
+                               values + static_cast<size_t>(token) * cache->value_elements_per_token);
+        if (status != LM_OK) return status;
+    }
     return LM_OK;
 }
 

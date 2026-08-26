@@ -13,11 +13,14 @@
 
 struct lm_model_file {
     lm_file *file;
+    lm_file_shard_set *shards;
     lm_model_info info;
     lm_model_architecture architecture;
     uint8_t has_architecture;
     std::vector<lm_model_tensor_info> tensors;
     std::vector<std::string> tokens;
+    std::vector<uint64_t> shard_headers;
+    std::vector<uint64_t> shard_sizes;
 };
 
 namespace {
@@ -144,6 +147,7 @@ public:
     }
 
     bool u8(uint8_t *value) { return read(value, 1u); }
+    bool u16(uint16_t *value) { unsigned char bytes[2] = {}; if (!read(bytes, 2u)) return false; *value = static_cast<uint16_t>(bytes[0] | (static_cast<uint16_t>(bytes[1]) << 8u)); return true; }
     bool u32(uint32_t *value) { unsigned char bytes[4] = {}; if (!read(bytes, 4u)) return false; *value = read_u32_le(bytes); return true; }
     bool u64(uint64_t *value) { unsigned char bytes[8] = {}; if (!read(bytes, 8u)) return false; *value = read_u64_le(bytes); return true; }
 
@@ -198,6 +202,23 @@ bool skip_gguf_value(BinaryReader &reader, uint32_t type, uint32_t depth) {
         }
         default: return false;
     }
+}
+
+struct GgufSplitInfo {
+    uint64_t count = 1u;
+    uint64_t number = 0u;
+    uint64_t tensor_count = 0u;
+    bool has_count = false;
+    bool has_number = false;
+    bool has_tensor_count = false;
+};
+
+bool read_gguf_split_value(BinaryReader &reader, uint32_t type, uint64_t *value) {
+    if (!value) return false;
+    if (type == 2u) { uint16_t parsed = 0u; if (!reader.u16(&parsed)) return false; *value = parsed; return true; }
+    if (type == 4u) { uint32_t parsed = 0u; if (!reader.u32(&parsed)) return false; *value = parsed; return true; }
+    if (type == 10u) return reader.u64(value);
+    return false;
 }
 
 bool read_gguf_alignment(BinaryReader &reader, uint32_t type, uint64_t *alignment) {
@@ -270,7 +291,8 @@ bool read_token_array(BinaryReader &reader, uint32_t type, std::vector<std::stri
 lm_status inspect_gguf(const char *path, lm_model_info *out_info, char *error_text, size_t error_capacity,
                        std::vector<lm_model_tensor_info> *out_tensors = nullptr,
                        std::vector<std::string> *out_tokens = nullptr,
-                       lm_model_architecture *out_architecture = nullptr) {
+                       lm_model_architecture *out_architecture = nullptr,
+                       GgufSplitInfo *out_split = nullptr) {
     BinaryReader reader(path);
     if (!reader.good()) { set_error(error_text, error_capacity, "cannot open model file"); return LM_ERR_IO; }
     if (reader.size() < 24u) { set_error(error_text, error_capacity, "GGUF header is truncated"); return LM_ERR_PARSE; }
@@ -291,6 +313,7 @@ lm_status inspect_gguf(const char *path, lm_model_info *out_info, char *error_te
     uint64_t experts_per_token = 0u;
     bool has_expert_count = false;
     bool has_experts_per_token = false;
+    GgufSplitInfo split;
     std::vector<std::string> tokens;
     lm_model_architecture architecture{};
     bool is_llama = false;
@@ -321,6 +344,21 @@ lm_status inspect_gguf(const char *path, lm_model_info *out_info, char *error_te
             if (alignment == 0u || alignment > (1ull << 20u) || (alignment % 8u) != 0u) {
                 set_error(error_text, error_capacity, "GGUF alignment must be a bounded multiple of 8"); return LM_ERR_PARSE;
             }
+        } else if (key == "split.count") {
+            if (split.has_count || !read_gguf_split_value(reader, type, &split.count) || split.count == 0u) {
+                set_error(error_text, error_capacity, "invalid GGUF split count metadata"); return LM_ERR_PARSE;
+            }
+            split.has_count = true;
+        } else if (key == "split.no") {
+            if (split.has_number || !read_gguf_split_value(reader, type, &split.number)) {
+                set_error(error_text, error_capacity, "invalid GGUF split number metadata"); return LM_ERR_PARSE;
+            }
+            split.has_number = true;
+        } else if (key == "split.tensors.count") {
+            if (split.has_tensor_count || !read_gguf_split_value(reader, type, &split.tensor_count) || split.tensor_count == 0u) {
+                set_error(error_text, error_capacity, "invalid GGUF split tensor count metadata"); return LM_ERR_PARSE;
+            }
+            split.has_tensor_count = true;
         } else if (has_suffix(key, ".expert_count")) {
             if (!read_moe_count(reader, type, &expert_count)) {
                 set_error(error_text, error_capacity, "invalid GGUF expert count metadata"); return LM_ERR_PARSE;
@@ -366,6 +404,10 @@ lm_status inspect_gguf(const char *path, lm_model_info *out_info, char *error_te
         has_head_count_kv && has_intermediate_length && has_rope_frequency_base &&
         architecture.head_count_kv <= architecture.head_count && architecture.embedding_length > 0u) {
         if (out_architecture) *out_architecture = architecture;
+    }
+    if (split.count == 0u || split.number >= split.count || (split.has_count != split.has_number) ||
+        (split.has_tensor_count && split.tensor_count < tensor_count)) {
+        set_error(error_text, error_capacity, "invalid GGUF split metadata"); return LM_ERR_PARSE;
     }
     if ((has_expert_count != has_experts_per_token) || expert_count == 0u || experts_per_token == 0u ||
         expert_count > UINT32_MAX || experts_per_token > UINT32_MAX || experts_per_token > expert_count) {
@@ -449,6 +491,7 @@ lm_status inspect_gguf(const char *path, lm_model_info *out_info, char *error_te
     out_info->tensor_count = tensor_count;
     out_info->expert_count = has_expert_count ? static_cast<uint32_t>(expert_count) : 0u;
     out_info->experts_per_token = has_experts_per_token ? static_cast<uint32_t>(experts_per_token) : 0u;
+    if (out_split) *out_split = split;
     return LM_OK;
 }
 
@@ -794,9 +837,11 @@ lm_status lm_model_open(const char *path, lm_model_file **out_model, char *error
     const lm_status opened = lm_file_open(path, &file);
     if (opened != LM_OK) return opened;
     try {
-        lm_model_file *model = new lm_model_file{file, info, architecture,
+        lm_model_file *model = new lm_model_file{file, nullptr, info, architecture,
                                                    static_cast<uint8_t>(architecture.block_count != 0u),
-                                                   std::move(tensors), std::move(tokens)};
+                                                   std::move(tensors), std::move(tokens),
+                                                   std::vector<uint64_t>{info.header_bytes},
+                                                   std::vector<uint64_t>{info.file_bytes}};
         *out_model = model;
         return LM_OK;
     } catch (const std::bad_alloc &) {
@@ -805,9 +850,161 @@ lm_status lm_model_open(const char *path, lm_model_file **out_model, char *error
     }
 }
 
+static lm_status open_safetensors_sharded(const char *const *paths, size_t path_count,
+                                          lm_model_file **out_model, char *error_text,
+                                          size_t error_capacity) {
+    lm_model_info combined{};
+    std::vector<lm_model_tensor_info> tensors;
+    std::vector<std::string> tokens;
+    std::vector<uint64_t> headers;
+    std::vector<uint64_t> sizes;
+    lm_model_architecture architecture{};
+    for (size_t shard = 0u; shard < path_count; ++shard) {
+        if (!paths[shard]) return LM_ERR_ARGUMENT;
+        lm_model_info part_info{};
+        lm_model_architecture part_architecture{};
+        std::vector<lm_model_tensor_info> part_tensors;
+        std::vector<std::string> part_tokens;
+        const lm_status parsed = inspect_safetensors(paths[shard], &part_info, error_text, error_capacity,
+                                                      &part_tensors, &part_tokens, &part_architecture);
+        if (parsed != LM_OK) return parsed;
+        if (part_info.format != LM_MODEL_SAFETENSORS) {
+            set_error(error_text, error_capacity, "mixed model formats in SafeTensors shard set"); return LM_ERR_PARSE;
+        }
+        if (shard == 0u) { combined = part_info; architecture = part_architecture; tokens = std::move(part_tokens); }
+        else {
+            const bool architecture_mismatch = architecture.context_length != part_architecture.context_length ||
+                architecture.embedding_length != part_architecture.embedding_length || architecture.block_count != part_architecture.block_count ||
+                architecture.head_count != part_architecture.head_count || architecture.head_count_kv != part_architecture.head_count_kv ||
+                architecture.intermediate_length != part_architecture.intermediate_length || architecture.rope_frequency_base != part_architecture.rope_frequency_base;
+            if (architecture_mismatch || part_tokens != tokens) {
+                set_error(error_text, error_capacity, "inconsistent SafeTensors shard metadata"); return LM_ERR_PARSE;
+            }
+        }
+        for (lm_model_tensor_info &tensor : part_tensors) {
+            for (const lm_model_tensor_info &existing : tensors)
+                if (std::strncmp(existing.name, tensor.name, sizeof(existing.name)) == 0) {
+                    set_error(error_text, error_capacity, "duplicate tensor across SafeTensors shards"); return LM_ERR_PARSE;
+                }
+            tensor.shard_index = static_cast<uint32_t>(shard);
+            tensors.push_back(tensor);
+        }
+        if (combined.file_bytes > UINT64_MAX - part_info.file_bytes) return LM_ERR_RANGE;
+        if (shard != 0u) combined.file_bytes += part_info.file_bytes;
+        headers.push_back(part_info.header_bytes); sizes.push_back(part_info.file_bytes);
+    }
+    if (tensors.empty() || tensors.size() > kMaxContainerItems) return LM_ERR_CAPACITY;
+    lm_file_shard_set *shards = nullptr;
+    const lm_status opened = lm_file_shard_set_open(paths, path_count, &shards);
+    if (opened != LM_OK) return opened;
+    combined.tensor_count = tensors.size();
+    try {
+        *out_model = new lm_model_file{nullptr, shards, combined, architecture,
+                                       static_cast<uint8_t>(architecture.block_count != 0u),
+                                       std::move(tensors), std::move(tokens),
+                                       std::move(headers), std::move(sizes)};
+        return LM_OK;
+    } catch (const std::bad_alloc &) {
+        lm_file_shard_set_close(shards); return LM_ERR_CAPACITY;
+    }
+}
+
+lm_status lm_model_open_sharded(const char *const *paths, size_t path_count,
+                                lm_model_file **out_model, char *error_text,
+                                size_t error_capacity) {
+    if (!paths || path_count == 0u || !out_model) return LM_ERR_ARGUMENT;
+    *out_model = nullptr;
+    if (path_count == 1u) return lm_model_open(paths[0], out_model, error_text, error_capacity);
+    lm_model_info first_info{};
+    const lm_status first_status = lm_model_inspect(paths[0], &first_info, error_text, error_capacity);
+    if (first_status != LM_OK) return first_status;
+    if (first_info.format == LM_MODEL_SAFETENSORS)
+        return open_safetensors_sharded(paths, path_count, out_model, error_text, error_capacity);
+    if (first_info.format != LM_MODEL_GGUF) return LM_ERR_UNSUPPORTED;
+    lm_model_info combined{};
+    std::vector<lm_model_tensor_info> tensors;
+    std::vector<std::string> tokens;
+    std::vector<uint64_t> headers;
+    std::vector<uint64_t> sizes;
+    lm_model_architecture architecture{};
+    GgufSplitInfo expected_split{};
+    for (size_t shard = 0u; shard < path_count; ++shard) {
+        if (!paths[shard]) return LM_ERR_ARGUMENT;
+        lm_model_info part_info{};
+        lm_model_architecture part_architecture{};
+        GgufSplitInfo part_split{};
+        std::vector<lm_model_tensor_info> part_tensors;
+        std::vector<std::string> part_tokens;
+        const lm_status parsed = inspect_gguf(paths[shard], &part_info, error_text, error_capacity,
+                                              &part_tensors, &part_tokens, &part_architecture, &part_split);
+        if (parsed != LM_OK) return parsed;
+        if (part_info.format != LM_MODEL_GGUF || !part_split.has_count || !part_split.has_number ||
+            !part_split.has_tensor_count || part_split.count != path_count || part_split.number != shard ||
+            part_split.tensor_count == 0u) {
+            set_error(error_text, error_capacity, "invalid GGUF split membership"); return LM_ERR_PARSE;
+        }
+        if (shard == 0u) {
+            combined = part_info;
+            expected_split = part_split;
+            architecture = part_architecture;
+            tokens = std::move(part_tokens);
+        } else {
+            const bool architecture_mismatch = architecture.context_length != part_architecture.context_length ||
+                architecture.embedding_length != part_architecture.embedding_length ||
+                architecture.block_count != part_architecture.block_count ||
+                architecture.head_count != part_architecture.head_count ||
+                architecture.head_count_kv != part_architecture.head_count_kv ||
+                architecture.intermediate_length != part_architecture.intermediate_length ||
+                architecture.rope_frequency_base != part_architecture.rope_frequency_base;
+            if (architecture_mismatch || part_tokens != tokens) {
+                set_error(error_text, error_capacity, "inconsistent GGUF split metadata"); return LM_ERR_PARSE;
+            }
+            if (part_split.tensor_count != expected_split.tensor_count) {
+                set_error(error_text, error_capacity, "inconsistent GGUF split tensor count"); return LM_ERR_PARSE;
+            }
+        }
+        for (lm_model_tensor_info &tensor : part_tensors) {
+            for (const lm_model_tensor_info &existing : tensors) {
+                if (std::strncmp(existing.name, tensor.name, sizeof(existing.name)) == 0) {
+                    set_error(error_text, error_capacity, "duplicate tensor across GGUF splits"); return LM_ERR_PARSE;
+                }
+            }
+            tensor.shard_index = static_cast<uint32_t>(shard);
+            tensors.push_back(tensor);
+        }
+        if (combined.tensor_count > UINT64_MAX - part_info.tensor_count ||
+            combined.file_bytes > UINT64_MAX - part_info.file_bytes)
+            return LM_ERR_RANGE;
+        if (shard != 0u) combined.tensor_count += part_info.tensor_count;
+        combined.file_bytes += shard == 0u ? 0u : part_info.file_bytes;
+        headers.push_back(part_info.header_bytes);
+        sizes.push_back(part_info.file_bytes);
+    }
+    if (!expected_split.has_tensor_count || expected_split.tensor_count != tensors.size()) {
+        set_error(error_text, error_capacity, "GGUF split tensor count does not match unified index"); return LM_ERR_PARSE;
+    }
+    if (tensors.empty() || tensors.size() > kMaxContainerItems) return LM_ERR_CAPACITY;
+    lm_file_shard_set *shards = nullptr;
+    const lm_status opened = lm_file_shard_set_open(paths, path_count, &shards);
+    if (opened != LM_OK) return opened;
+    combined.tensor_count = tensors.size();
+    try {
+        lm_model_file *model = new lm_model_file{nullptr, shards, combined, architecture,
+                                                   static_cast<uint8_t>(architecture.block_count != 0u),
+                                                   std::move(tensors), std::move(tokens),
+                                                   std::move(headers), std::move(sizes)};
+        *out_model = model;
+        return LM_OK;
+    } catch (const std::bad_alloc &) {
+        lm_file_shard_set_close(shards);
+        return LM_ERR_CAPACITY;
+    }
+}
+
 void lm_model_close(lm_model_file *model) {
     if (!model) return;
-    lm_file_close(model->file);
+    if (model->shards) lm_file_shard_set_close(model->shards);
+    else lm_file_close(model->file);
     delete model;
 }
 
@@ -915,10 +1112,25 @@ lm_status lm_model_token_decode(const lm_model_file *model, const uint32_t *toke
 
 lm_status lm_model_tensor_span(const lm_model_file *model, uint64_t relative_offset, uint64_t bytes, lm_file_span *out_span) {
     if (!model || !out_span) return LM_ERR_ARGUMENT;
+    if (model->shards) return LM_ERR_UNSUPPORTED;
     if (relative_offset > model->info.file_bytes - model->info.header_bytes ||
         bytes > model->info.file_bytes - model->info.header_bytes - relative_offset)
         return LM_ERR_RANGE;
     return lm_file_span_make(model->file, model->info.header_bytes + relative_offset, bytes, out_span);
+}
+
+lm_status lm_model_tensor_span_at(const lm_model_file *model, uint64_t index, uint64_t bytes, lm_file_span *out_span) {
+    if (!model || !out_span || index >= model->tensors.size()) return LM_ERR_ARGUMENT;
+    const lm_model_tensor_info &descriptor = model->tensors[static_cast<size_t>(index)];
+    if (!model->shards) return lm_model_tensor_span(model, descriptor.relative_offset, bytes, out_span);
+    if (descriptor.shard_index >= model->shard_headers.size() ||
+        descriptor.shard_index >= model->shard_sizes.size()) return LM_ERR_RANGE;
+    const uint64_t header_bytes = model->shard_headers[descriptor.shard_index];
+    const uint64_t data_bytes = model->shard_sizes[descriptor.shard_index] - header_bytes;
+    if (descriptor.relative_offset > data_bytes || bytes > data_bytes - descriptor.relative_offset)
+        return LM_ERR_RANGE;
+    return lm_file_shard_set_span(model->shards, descriptor.shard_index,
+                                  header_bytes + descriptor.relative_offset, bytes, out_span);
 }
 
 lm_status lm_model_tensor_bind_native(const lm_model_file *model, uint64_t index, lm_model_tensor_binding *out_binding) {
@@ -933,15 +1145,19 @@ lm_status lm_model_tensor_bind_native(const lm_model_file *model, uint64_t index
     const lm_status contract = native_contract(descriptor, &format, &elements_per_block,
                                                 &bytes_per_block, &elements, &expected_bytes);
     if (contract != LM_OK) return contract;
-    const uint64_t data_bytes = model->info.file_bytes - model->info.header_bytes;
-    uint64_t limit = data_bytes;
+    uint64_t limit = model->info.file_bytes - model->info.header_bytes;
+    if (model->shards) {
+        if (descriptor.shard_index >= model->shard_headers.size() || descriptor.shard_index >= model->shard_sizes.size()) return LM_ERR_RANGE;
+        limit = model->shard_sizes[descriptor.shard_index] - model->shard_headers[descriptor.shard_index];
+    }
     for (const lm_model_tensor_info &other : model->tensors) {
-        if (other.relative_offset > descriptor.relative_offset && other.relative_offset < limit)
+        if (other.shard_index == descriptor.shard_index &&
+            other.relative_offset > descriptor.relative_offset && other.relative_offset < limit)
             limit = other.relative_offset;
     }
     if (descriptor.relative_offset > limit || expected_bytes > limit - descriptor.relative_offset) return LM_ERR_PARSE;
     lm_file_span span{};
-    const lm_status spanned = lm_model_tensor_span(model, descriptor.relative_offset, expected_bytes, &span);
+    const lm_status spanned = lm_model_tensor_span_at(model, index, expected_bytes, &span);
     if (spanned != LM_OK) return spanned;
     std::memset(out_binding, 0, sizeof(*out_binding));
     out_binding->descriptor = descriptor;
@@ -997,7 +1213,7 @@ lm_status lm_model_tensor_matvec_f32_cpu(const lm_model_file *model, uint64_t te
     if (descriptor.rank != 2u || descriptor.type != LM_DTYPE_F32 || descriptor.dims[0] != rows ||
         descriptor.dims[1] != columns) return LM_ERR_UNSUPPORTED;
     lm_file_span span{};
-    status = lm_model_tensor_span(model, descriptor.relative_offset, bytes, &span);
+    status = lm_model_tensor_span_at(model, tensor_index, bytes, &span);
     if (status != LM_OK) return status;
     status = lm_file_span_read(&span, 0u, matrix_scratch, static_cast<size_t>(bytes));
     if (status != LM_OK) return status;

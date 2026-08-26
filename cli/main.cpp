@@ -42,6 +42,39 @@ static bool parse_bounded_u32(const char *text, uint32_t *out) {
     return true;
 }
 
+static lm_status open_cli_model(const char *path, lm_model_file **out_model, char *error, size_t error_capacity) {
+    if (!path || !out_model) return LM_ERR_ARGUMENT;
+    const std::string source(path);
+    const size_t of = source.find("-of-");
+    const size_t dash = of == std::string::npos ? std::string::npos : source.rfind('-', of - 1u);
+    if (of == std::string::npos || dash == std::string::npos) return lm_model_open(path, out_model, error, error_capacity);
+    const std::string index_text = source.substr(dash + 1u, of - dash - 1u);
+    const size_t count_begin = of + 4u;
+    const size_t count_end = source.find_first_not_of("0123456789", count_begin);
+    if (index_text.empty() || count_end == std::string::npos || count_end == count_begin) return LM_ERR_PARSE;
+    char *index_end = nullptr;
+    char *count_end_ptr = nullptr;
+    const unsigned long index = std::strtoul(index_text.c_str(), &index_end, 10);
+    const std::string count_text = source.substr(count_begin, count_end - count_begin);
+    const unsigned long count = std::strtoul(count_text.c_str(), &count_end_ptr, 10);
+    if (index_end != index_text.c_str() + index_text.size() || count_end_ptr != count_text.c_str() + count_text.size() ||
+        index != 1u || count < 2u || count > 1024u) return LM_ERR_UNSUPPORTED;
+    const std::string prefix = source.substr(0u, dash + 1u);
+    const std::string suffix = source.substr(count_end);
+    std::vector<std::string> paths;
+    std::vector<const char *> path_ptrs;
+    paths.reserve(count); path_ptrs.reserve(count);
+    const size_t width = index_text.size() > count_text.size() ? index_text.size() : count_text.size();
+    for (unsigned long part = 1u; part <= count; ++part) {
+        char part_index[32] = {}; char part_count[32] = {};
+        std::snprintf(part_index, sizeof(part_index), "%0*lu", static_cast<int>(width), part);
+        std::snprintf(part_count, sizeof(part_count), "%0*lu", static_cast<int>(width), count);
+        paths.emplace_back(prefix + part_index + "-of-" + part_count + suffix);
+    }
+    for (const std::string &part : paths) path_ptrs.push_back(part.c_str());
+    return lm_model_open_sharded(path_ptrs.data(), path_ptrs.size(), out_model, error, error_capacity);
+}
+
 static lm_status run_native_generation(const lm_config &config, const char *prompt,
                                        uint32_t max_new_tokens, char *result,
                                        size_t result_capacity, size_t *result_bytes) {
@@ -49,7 +82,7 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
         (result == nullptr) != (result_bytes == nullptr)) return LM_ERR_ARGUMENT;
     lm_model_file *model = nullptr;
     char error[128] = {};
-    lm_status status = lm_model_open(config.model_path, &model, error, sizeof(error));
+    lm_status status = open_cli_model(config.model_path, &model, error, sizeof(error));
     if (status != LM_OK) {
         std::fprintf(stderr, "model open failed: %s (%s)\\n", lm_status_name(status), error);
         return status;
