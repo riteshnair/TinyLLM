@@ -576,6 +576,33 @@ static void test_safetensors_native_mlp() {
     std::remove(path);
 }
 
+static void test_model_bound_f32_router() {
+    const char *path = "test-model-bound-router.safetensors";
+    const char *json = "{\"router.weight\":{\"dtype\":\"F32\",\"shape\":[3,2],\"data_offsets\":[0,24]}}";
+    {
+        std::ofstream file(path, std::ios::binary);
+        const uint64_t header_bytes = std::strlen(json);
+        file.write(reinterpret_cast<const char *>(&header_bytes), sizeof(header_bytes));
+        file.write(json, static_cast<std::streamsize>(header_bytes));
+        const float weights[6] = {1.0f, 0.0f, 0.0f, 2.0f, -1.0f, 1.0f};
+        file.write(reinterpret_cast<const char *>(weights), sizeof(weights));
+    }
+    lm_model_file *model = nullptr;
+    char error[128] = {};
+    assert(lm_model_open(path, &model, error, sizeof(error)) == LM_OK);
+    const float input[2] = {1.0f, 1.0f};
+    unsigned char scratch[24] = {};
+    lm_moe_route route{};
+    assert(lm_model_moe_route_f32_cpu(model, 0u, scratch, sizeof(scratch), input, 2u, 3u, 1u,
+                                      LM_MOE_SOFTMAX_SELECTED_ONLY, &route) == LM_OK);
+    assert(route.expert_count == 3u && route.experts_per_token == 1u && route.selected[0] == 1u);
+    assert(std::fabs(route.weights[0] - 1.0f) < 1.0e-6f);
+    assert(lm_model_moe_route_f32_cpu(model, 0u, scratch, sizeof(scratch) - 1u, input, 2u, 3u, 1u,
+                                      LM_MOE_SOFTMAX_SELECTED_ONLY, &route) == LM_ERR_CAPACITY);
+    lm_model_close(model);
+    std::remove(path);
+}
+
 static void test_native_mlp_profile() {
     auto put_u32 = [](std::vector<unsigned char> *bytes, uint32_t value) {
         for (unsigned i = 0u; i < 4u; ++i) bytes->push_back(static_cast<unsigned char>((value >> (8u * i)) & 0xffu));
@@ -1472,6 +1499,7 @@ int main() {
     test_model_and_cpu_math();
     test_safetensors_parser();
     test_safetensors_native_mlp();
+    test_model_bound_f32_router();
     test_tokenizer();
     test_sampling();
     test_cpu_decoder();

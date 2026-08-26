@@ -991,6 +991,28 @@ lm_status lm_model_moe_selected_expert_mlp_q4_k(const lm_model_file *model,
     return LM_OK;
 }
 
+lm_status lm_model_moe_route_f32_cpu(const lm_model_file *model, uint64_t router_tensor,
+                                     void *matrix_scratch, uint64_t scratch_bytes,
+                                     const float *input, uint32_t hidden_size,
+                                     uint32_t expert_count, uint32_t experts_per_token,
+                                     lm_moe_route_policy policy, lm_moe_route *out_route) {
+    if (!model || !matrix_scratch || !input || !out_route || hidden_size == 0u || expert_count == 0u ||
+        experts_per_token == 0u || experts_per_token > expert_count ||
+        (policy != LM_MOE_SOFTMAX_ALL_THEN_TOPK && policy != LM_MOE_SOFTMAX_SELECTED_ONLY))
+        return LM_ERR_ARGUMENT;
+    if (!finite_array(input, hidden_size)) return LM_ERR_RANGE;
+    lm_model_tensor_info descriptor{};
+    lm_status status = lm_model_tensor_info_at(model, router_tensor, &descriptor);
+    if (status != LM_OK) return status;
+    if (descriptor.rank != 2u || descriptor.type != LM_DTYPE_F32 || descriptor.dims[0] != expert_count ||
+        descriptor.dims[1] != hidden_size) return LM_ERR_UNSUPPORTED;
+    std::vector<float> logits(expert_count, 0.0f);
+    status = lm_model_tensor_matvec_f32_cpu(model, router_tensor, matrix_scratch, scratch_bytes,
+                                            expert_count, hidden_size, input, logits.data());
+    if (status != LM_OK) return status;
+    return lm_cpu_moe_route(logits.data(), expert_count, experts_per_token, policy, out_route);
+}
+
 static lm_status validate_q4_k_binding_matvec(const lm_model_tensor_binding *binding,
                                                 uint32_t rows, uint32_t columns,
                                                 uint64_t *payload_bytes, uint32_t *blocks_per_row) {

@@ -360,7 +360,6 @@ lm_status lm_model_tensor_matvec_f32_cpu(const lm_model_file *model, uint64_t te
                                          uint32_t rows, uint32_t columns,
                                          const float *input, float *out);
 
-
 void lm_config_init(lm_config *config);
 lm_status lm_config_parse_argv(lm_config *config, int argc, char **argv,
                                const char **bad_argument);
@@ -454,6 +453,12 @@ typedef struct lm_moe_tensor_mapping {
     uint32_t rank;
     uint64_t dims[8];
 } lm_moe_tensor_mapping;
+
+lm_status lm_model_moe_route_f32_cpu(const lm_model_file *model, uint64_t router_tensor,
+                                     void *matrix_scratch, uint64_t scratch_bytes,
+                                     const float *input, uint32_t hidden_size,
+                                     uint32_t expert_count, uint32_t experts_per_token,
+                                     lm_moe_route_policy policy, lm_moe_route *out_route);
 
 typedef enum lm_decoder_tensor_role {
     LM_DECODER_TENSOR_TOKEN_EMBEDDING = 0,
