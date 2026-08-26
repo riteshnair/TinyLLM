@@ -43,56 +43,91 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
     }
     lm_decoder_graph_binding graph{};
     status = lm_model_build_llama_graph(model, &graph);
-    if (status != LM_OK || graph.layer_count != 1u) {
+    if (status != LM_OK || graph.layer_count == 0u || graph.layer_count > LM_DECODER_PLAN_MAX_LAYERS) {
         lm_model_close(model);
         return status == LM_OK ? LM_ERR_UNSUPPORTED : status;
     }
     auto descriptor = [model](uint64_t index, lm_model_tensor_info *out) {
         return lm_model_tensor_info_at(model, index, out);
     };
-    lm_model_tensor_info embedding{}, output{}, gate{}, up{}, down{}, ffn_norm{}, output_norm{};
+    lm_model_tensor_info embedding{}, output{}, output_norm{};
     lm_model_architecture architecture{};
     if (lm_model_get_architecture(model, &architecture) != LM_OK || architecture.block_count != graph.layer_count ||
         architecture.embedding_length == 0u || architecture.intermediate_length == 0u ||
         architecture.head_count == 0u || architecture.head_count_kv == 0u ||
         architecture.head_count_kv > architecture.head_count ||
-        architecture.head_count % architecture.head_count_kv != 0u) {
+        architecture.head_count % architecture.head_count_kv != 0u ||
+        architecture.embedding_length % architecture.head_count != 0u) {
         lm_model_close(model);
         return LM_ERR_UNSUPPORTED;
     }
-    const lm_decoder_layer_binding &layer = graph.layers[0];
-    const uint64_t indices[] = {graph.token_embedding, graph.output, layer.ffn_gate,
-                                layer.ffn_up, layer.ffn_down};
-    lm_model_tensor_info *descriptors[] = {&embedding, &output, &gate, &up, &down};
-    for (uint32_t i = 0u; i < 5u; ++i) {
-        status = descriptor(indices[i], descriptors[i]);
-        if (status != LM_OK) { lm_model_close(model); return status; }
-    }
-    status = descriptor(layer.ffn_norm, &ffn_norm);
+    status = descriptor(graph.token_embedding, &embedding);
+    if (status != LM_OK) { lm_model_close(model); return status; }
+    status = descriptor(graph.output, &output);
     if (status != LM_OK) { lm_model_close(model); return status; }
     status = descriptor(graph.output_norm, &output_norm);
     if (status != LM_OK) { lm_model_close(model); return status; }
-    if (embedding.rank != 2u || output.rank != 2u || gate.rank != 2u || up.rank != 2u || down.rank != 2u ||
-        embedding.dims[1] != output.dims[0] || embedding.dims[0] != output.dims[1] ||
-        embedding.dims[0] != architecture.embedding_length || gate.dims[0] != architecture.intermediate_length ||
-        gate.dims[1] != embedding.dims[0] || up.dims[1] != embedding.dims[0] ||
-        down.dims[1] != gate.dims[0] || down.dims[0] != embedding.dims[0] ||
-        ffn_norm.rank != 1u || output_norm.rank != 1u || ffn_norm.dims[0] != embedding.dims[0] ||
-        output_norm.dims[0] != embedding.dims[0] ||
-        (embedding.type != 8u && embedding.type != 12u)) {
+    if (embedding.rank != 2u || output.rank != 2u || embedding.dims[1] != output.dims[0] ||
+        embedding.dims[0] != output.dims[1] || embedding.dims[0] != architecture.embedding_length ||
+        output_norm.rank != 1u || output_norm.dims[0] != embedding.dims[0] ||
+        (embedding.type != 8u && embedding.type != 12u) || output.type != embedding.type ||
+        output_norm.type != LM_DTYPE_F32) {
         lm_model_close(model);
         return LM_ERR_UNSUPPORTED;
     }
     const uint32_t matrix_type = embedding.type;
-    for (const lm_model_tensor_info *info : descriptors)
-        if (info->type != matrix_type) { lm_model_close(model); return LM_ERR_UNSUPPORTED; }
-    if (ffn_norm.type != LM_DTYPE_F32 || output_norm.type != LM_DTYPE_F32) {
+    std::vector<uint64_t> indices;
+    try {
+        indices.reserve(2u + static_cast<size_t>(graph.layer_count) * 7u);
+        indices.push_back(graph.token_embedding);
+        indices.push_back(graph.output);
+        for (uint32_t layer_index = 0u; layer_index < graph.layer_count; ++layer_index) {
+            const lm_decoder_layer_binding &layer = graph.layers[layer_index];
+            const uint64_t layer_indices[] = {layer.attn_q, layer.attn_k, layer.attn_v, layer.attn_output,
+                                               layer.ffn_gate, layer.ffn_down, layer.ffn_up};
+            lm_model_tensor_info layer_infos[7] = {};
+            for (uint32_t i = 0u; i < 7u; ++i) {
+                status = descriptor(layer_indices[i], &layer_infos[i]);
+                if (status != LM_OK) { lm_model_close(model); return status; }
+                if (layer_infos[i].type != matrix_type || layer_infos[i].rank != 2u) {
+                    lm_model_close(model); return LM_ERR_UNSUPPORTED;
+                }
+            }
+            const uint32_t head_dim = static_cast<uint32_t>(embedding.dims[0]) / architecture.head_count;
+            const uint32_t kv_width = head_dim * architecture.head_count_kv;
+            if (layer_infos[0].dims[0] != embedding.dims[0] || layer_infos[0].dims[1] != embedding.dims[0] ||
+                layer_infos[1].dims[0] != kv_width || layer_infos[1].dims[1] != embedding.dims[0] ||
+                layer_infos[2].dims[0] != kv_width || layer_infos[2].dims[1] != embedding.dims[0] ||
+                layer_infos[3].dims[0] != embedding.dims[0] || layer_infos[3].dims[1] != embedding.dims[0] ||
+                layer_infos[4].dims[0] != architecture.intermediate_length ||
+                layer_infos[4].dims[1] != embedding.dims[0] ||
+                layer_infos[5].dims[0] != embedding.dims[0] ||
+                layer_infos[5].dims[1] != architecture.intermediate_length ||
+                layer_infos[6].dims[0] != architecture.intermediate_length ||
+                layer_infos[6].dims[1] != embedding.dims[0]) {
+                lm_model_close(model); return LM_ERR_UNSUPPORTED;
+            }
+            lm_model_tensor_info attn_norm{};
+            lm_model_tensor_info ffn_norm{};
+            status = descriptor(layer.attn_norm, &attn_norm);
+            if (status != LM_OK || attn_norm.type != LM_DTYPE_F32 || attn_norm.rank != 1u ||
+                attn_norm.dims[0] != embedding.dims[0]) {
+                lm_model_close(model); return status != LM_OK ? status : LM_ERR_UNSUPPORTED;
+            }
+            status = descriptor(layer.ffn_norm, &ffn_norm);
+            if (status != LM_OK || ffn_norm.type != LM_DTYPE_F32 || ffn_norm.rank != 1u ||
+                ffn_norm.dims[0] != embedding.dims[0]) {
+                lm_model_close(model); return status != LM_OK ? status : LM_ERR_UNSUPPORTED;
+            }
+            for (uint32_t i = 0u; i < 7u; ++i) indices.push_back(layer_indices[i]);
+        }
+    } catch (...) {
         lm_model_close(model);
-        return LM_ERR_UNSUPPORTED;
+        return LM_ERR_CAPACITY;
     }
     uint32_t token_count = 0u;
     if (lm_model_token_count(model, &token_count) != LM_OK || token_count != output.dims[0] ||
-        token_count != embedding.dims[1] || embedding.dims[0] > 4096u || gate.dims[0] > 16384u) {
+        token_count != embedding.dims[1] || embedding.dims[0] > 4096u || architecture.intermediate_length > 16384u) {
         lm_model_close(model);
         return LM_ERR_UNSUPPORTED;
     }
@@ -122,7 +157,7 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
     generation.step.layer_index = 0u;
     generation.step.vocab_size = token_count;
     generation.step.hidden_size = static_cast<uint32_t>(embedding.dims[0]);
-    generation.step.intermediate_size = static_cast<uint32_t>(gate.dims[0]);
+    generation.step.intermediate_size = architecture.intermediate_length;
     generation.step.head_count = architecture.head_count;
     generation.step.head_count_kv = architecture.head_count_kv;
     generation.step.use_rope = 0u;

@@ -4,11 +4,11 @@ TinyLLM is a compact, Vulkan-first modular LLM inference engine with a strict C9
 
 ## Current validated slice
 
-The repository currently provides bounded GGUF/SafeTensors inspection, exact native GGML Q4_0/Q8_0/Q4_K storage contracts, lazy file-span bindings, replaceable Vulkan packed dot and matvec shaders, paged KV metadata plus bounded opaque payloads with copy-on-write, exact bounded GGUF vocabulary parsing, deterministic sampling, and a narrow native single-layer path.
+The repository currently provides bounded GGUF/SafeTensors inspection, exact native GGML Q4_0/Q8_0/Q4_K storage contracts, lazy file-span bindings, replaceable Vulkan packed dot and matvec shaders, paged KV metadata plus bounded opaque payloads with copy-on-write, exact bounded GGUF vocabulary parsing, deterministic sampling, and a narrow native multi-layer path.
 
-The narrow path can validate a multi-layer, one-head, equal-Q/KV-width profile when every layer satisfies the same explicit shape and native-format contract; execute native Q8_0 MLP and attention operations; use an explicit F32 KV payload per layer; produce logits; encode a bounded prompt; and run a bounded deterministic generation loop. It is exposed through the library API and the CLI’s `--generate` entrypoint. This is a real tested vertical slice, not arbitrary-checkpoint compatibility.
+The narrow path validates a multi-layer Llama metadata profile with two query heads and one KV head when every layer satisfies the same explicit shape and native-format contract; executes native Q8_0 MLP and attention operations; uses an explicit F32 KV payload per layer; produces logits; encodes a bounded prompt; and runs a bounded deterministic generation loop. It is exposed through the library API and the CLI’s `--generate` entrypoint. This is a real tested vertical slice, not arbitrary-checkpoint compatibility.
 
-The engine deliberately returns named unsupported errors for capabilities outside the validated profile. Full multi-layer architecture metadata, broad tokenizer semantics, GQA variants, quantized KV policy, model residency scheduling, batching, streaming, server/WebUI integration, distributed execution, and future ROCr/HSA backends remain pending.
+The engine deliberately returns named unsupported errors for capabilities outside the validated profile. Architecture families beyond the bounded Llama scalar contract, broader GQA variants, broad tokenizer semantics, quantized KV policy, model residency scheduling, full MoE graph/router integration, batching, streaming, server/WebUI integration, distributed execution, and future ROCr/HSA backends remain pending.
 
 ## Build
 
@@ -40,7 +40,7 @@ For the validated narrow profile, use:
   --generate --prompt "ab" --max-new-tokens 8
 ```
 
-The CLI currently accepts only the narrow validated GGUF profile and its exact tensor names, shapes, native matrix types, and GGUF vocabulary contract; the library API supports the validated multi-layer same-shape path.
+The CLI accepts the narrow validated multi-layer GGUF profile and checks every layer’s exact tensor names, shapes, native matrix type, and GGUF vocabulary contract before generation; the library API additionally exposes model-bound selected-expert Q4_K staging for the validated expert-major rank-3 Mixtral contract.
 
 ## Source layout
 
@@ -57,7 +57,7 @@ The CLI currently accepts only the narrow validated GGUF profile and its exact t
 | `vulkan/device.cpp` | Vulkan device discovery |
 | `vulkan/dp4.cpp` | Reference packed-int8 DP4 dispatch |
 | `vulkan/shaders/dot_i8_dp4.comp` | DP4 compute shader source |
-| `cli/main.cpp` | Local control CLI, device listing, and narrow generation entrypoint |
+| `cli/main.cpp` | Local control CLI, device listing, and narrow multi-layer generation entrypoint |
 | `tests/test_core.cpp` | Focused unit and smoke tests |
 | `CMakeLists.txt` | Minimal build definition |
 
