@@ -687,6 +687,21 @@ lm_status lm_model_execute_native_transformer(const lm_model_file *model,
                                               size_t logits_count);
 
 /* Bounded local generation for the narrow profile; prompt IDs must come from the model tokenizer. */
+typedef enum lm_context_policy {
+    LM_CONTEXT_REJECT_OVERFLOW = 0,
+    LM_CONTEXT_ROLLING_TAIL = 1
+} lm_context_policy;
+
+lm_status lm_context_compact_tokens(const uint32_t *input_tokens, size_t input_count,
+                                    uint32_t keep_prefix, uint32_t max_tokens,
+                                    uint32_t *out_tokens, size_t out_capacity,
+                                    size_t *out_count);
+lm_status lm_model_compact_context_text(const lm_model_file *model, const char *text,
+                                        size_t text_bytes, uint32_t keep_prefix,
+                                        uint32_t max_tokens, uint32_t *scratch_tokens,
+                                        size_t scratch_capacity, char *out_text,
+                                        size_t out_capacity, size_t *out_bytes);
+
 typedef struct lm_native_generation_config {
     lm_native_step_config step;
     lm_sampling_config sampling;
@@ -695,6 +710,9 @@ typedef struct lm_native_generation_config {
     uint8_t has_stop_token;
     uint8_t has_architecture;
     lm_model_architecture architecture;
+    lm_context_policy context_policy;
+    uint32_t context_window;
+    uint32_t context_keep_prefix;
 } lm_native_generation_config;
 
 typedef lm_status (*lm_native_token_callback)(void *user, uint32_t token_id, float probability);

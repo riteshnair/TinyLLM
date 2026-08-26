@@ -727,6 +727,26 @@ static lm_status lm_model_generate_native_impl(const lm_model_file *model,
         return LM_ERR_ARGUMENT;
     for (size_t i = 0u; i < prompt_count; ++i)
         if (prompt_tokens[i] >= config->step.vocab_size) return LM_ERR_RANGE;
+    if (config->context_policy != LM_CONTEXT_REJECT_OVERFLOW && config->context_policy != LM_CONTEXT_ROLLING_TAIL)
+        return LM_ERR_ARGUMENT;
+    std::vector<uint32_t> rolled_prompt;
+    if (config->context_window != 0u) {
+        if (config->context_window > (1u << 20u) || config->max_new_tokens > config->context_window ||
+            config->context_keep_prefix > config->context_window - config->max_new_tokens)
+            return LM_ERR_ARGUMENT;
+        const size_t prompt_limit = static_cast<size_t>(config->context_window - config->max_new_tokens);
+        if (prompt_count > prompt_limit) {
+            if (config->context_policy == LM_CONTEXT_REJECT_OVERFLOW) return LM_ERR_CAPACITY;
+            const size_t keep = std::min(static_cast<size_t>(config->context_keep_prefix), prompt_limit);
+            const size_t tail = prompt_limit - keep;
+            try { rolled_prompt.reserve(prompt_limit); }
+            catch (const std::bad_alloc &) { return LM_ERR_CAPACITY; }
+            rolled_prompt.insert(rolled_prompt.end(), prompt_tokens, prompt_tokens + keep);
+            rolled_prompt.insert(rolled_prompt.end(), prompt_tokens + prompt_count - tail, prompt_tokens + prompt_count);
+            prompt_tokens = rolled_prompt.data();
+            prompt_count = rolled_prompt.size();
+        }
+    }
     const uint32_t context_tokens = static_cast<uint32_t>(prompt_count) + config->max_new_tokens;
     const uint64_t kv_elements = (static_cast<uint64_t>(config->step.hidden_size) /
                                   config->step.head_count) * config->step.head_count_kv;
@@ -874,6 +894,47 @@ lm_status lm_model_generate_native_text(const lm_model_file *model,
     if (status != LM_OK) return status;
     return lm_model_token_decode(model, generated.data(), generated_count, out_text,
                                  out_capacity, out_bytes);
+}
+
+lm_status lm_context_compact_tokens(const uint32_t *input_tokens, size_t input_count,
+                                    uint32_t keep_prefix, uint32_t max_tokens,
+                                    uint32_t *out_tokens, size_t out_capacity,
+                                    size_t *out_count) {
+    if ((!input_tokens && input_count != 0u) || !out_tokens || !out_count || max_tokens == 0u ||
+        keep_prefix > max_tokens || out_capacity < std::min(input_count, static_cast<size_t>(max_tokens)))
+        return LM_ERR_ARGUMENT;
+    if (input_count <= max_tokens) {
+        if (input_count != 0u) std::memcpy(out_tokens, input_tokens, input_count * sizeof(uint32_t));
+        *out_count = input_count;
+        return LM_OK;
+    }
+    const size_t keep = keep_prefix;
+    const size_t tail = static_cast<size_t>(max_tokens) - keep;
+    if (keep != 0u) std::memcpy(out_tokens, input_tokens, keep * sizeof(uint32_t));
+    if (tail != 0u) std::memcpy(out_tokens + keep, input_tokens + input_count - tail, tail * sizeof(uint32_t));
+    *out_count = max_tokens;
+    return LM_OK;
+}
+
+lm_status lm_model_compact_context_text(const lm_model_file *model, const char *text,
+                                        size_t text_bytes, uint32_t keep_prefix,
+                                        uint32_t max_tokens, uint32_t *scratch_tokens,
+                                        size_t scratch_capacity, char *out_text,
+                                        size_t out_capacity, size_t *out_bytes) {
+    if (!model || (!text && text_bytes != 0u) || !scratch_tokens || !out_text || !out_bytes ||
+        max_tokens == 0u || scratch_capacity < std::min(text_bytes + 1u, static_cast<size_t>(max_tokens)))
+        return LM_ERR_ARGUMENT;
+    size_t encoded_count = 0u;
+    lm_status status = lm_model_token_encode(model, text, text_bytes, scratch_tokens, scratch_capacity, &encoded_count);
+    if (status != LM_OK) return status;
+    std::vector<uint32_t> compacted;
+    try { compacted.resize(std::min(encoded_count, static_cast<size_t>(max_tokens))); }
+    catch (const std::bad_alloc &) { return LM_ERR_CAPACITY; }
+    size_t compacted_count = 0u;
+    status = lm_context_compact_tokens(scratch_tokens, encoded_count, keep_prefix, max_tokens,
+                                       compacted.data(), compacted.size(), &compacted_count);
+    if (status != LM_OK) return status;
+    return lm_model_token_decode(model, compacted.data(), compacted_count, out_text, out_capacity, out_bytes);
 }
 
 lm_status lm_model_generate_native_text_batch(const lm_model_file *model,

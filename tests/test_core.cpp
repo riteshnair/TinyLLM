@@ -643,6 +643,17 @@ static void test_safetensors_native_mlp() {
     size_t encoded_count = 0u;
     assert(lm_model_token_encode(model, text, 2u, encoded, 2u, &encoded_count) == LM_OK &&
            encoded_count == 2u && encoded[0] == 0u && encoded[1] == 1u);
+    const uint32_t long_tokens[] = {0u, 1u, 0u, 1u};
+    uint32_t compacted_tokens[3] = {};
+    size_t compacted_count = 0u;
+    assert(lm_context_compact_tokens(long_tokens, 4u, 1u, 3u, compacted_tokens, 3u, &compacted_count) == LM_OK);
+    assert(compacted_count == 3u && compacted_tokens[0] == 0u && compacted_tokens[1] == 0u && compacted_tokens[2] == 1u);
+    uint32_t text_scratch[8] = {};
+    char compacted_text[8] = {};
+    size_t compacted_bytes = 0u;
+    assert(lm_model_compact_context_text(model, "abab", 4u, 1u, 3u, text_scratch, 8u,
+                                         compacted_text, sizeof(compacted_text), &compacted_bytes) == LM_OK);
+    assert(compacted_bytes == 3u && std::memcmp(compacted_text, "aab", 3u) == 0);
     char decoded[8] = {};
     size_t decoded_bytes = 0u;
     assert(lm_model_token_decode(model, encoded, encoded_count, decoded, sizeof(decoded), &decoded_bytes) == LM_OK &&
@@ -1047,6 +1058,18 @@ static void test_native_mlp_profile() {
                                     sizeof(scratch), generated, 3u, &generated_count) == LM_OK);
     assert(generated_count == 1u && generated[0] == 1u);
     generation.has_stop_token = 0u;
+    const uint32_t long_prompt[] = {0u, 0u, 0u, 0u};
+    generation.context_window = 4u;
+    generation.context_keep_prefix = 1u;
+    generation.context_policy = LM_CONTEXT_ROLLING_TAIL;
+    assert(lm_model_generate_native(model, &graph, &generation, long_prompt, 4u, scratch,
+                                    sizeof(scratch), generated, 3u, &generated_count) == LM_OK);
+    assert(generated_count == 3u);
+    generation.context_policy = LM_CONTEXT_REJECT_OVERFLOW;
+    assert(lm_model_generate_native(model, &graph, &generation, long_prompt, 4u, scratch,
+                                    sizeof(scratch), generated, 3u, &generated_count) == LM_ERR_CAPACITY);
+    generation.context_window = 0u;
+    generation.context_keep_prefix = 0u;
     assert(lm_model_generate_native(model, &graph, &generation, prompt, 2u, scratch,
                                     sizeof(scratch), generated, 2u, &generated_count) == LM_ERR_ARGUMENT);
     char generated_text[4] = {};
