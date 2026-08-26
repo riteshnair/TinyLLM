@@ -89,6 +89,13 @@ typedef struct lm_config {
 
 typedef struct lm_runtime lm_runtime;
 typedef struct lm_buffer lm_buffer;
+typedef struct lm_rocr_runtime_info {
+    uint8_t runtime_present;
+    uint8_t initialized;
+    char library[128];
+} lm_rocr_runtime_info;
+lm_status lm_rocr_runtime_probe(lm_rocr_runtime_info *out_info);
+
 typedef struct lm_file lm_file;
 typedef struct lm_model_file lm_model_file;
 

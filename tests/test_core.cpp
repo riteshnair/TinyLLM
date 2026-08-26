@@ -36,6 +36,23 @@ static void test_defaults() {
     assert(config.threads == 1u);
 }
 
+static void test_rocr_probe() {
+    lm_rocr_runtime_info info{};
+    const lm_status status = lm_rocr_runtime_probe(&info);
+    assert(status == LM_OK || status == LM_ERR_UNSUPPORTED);
+    if (status == LM_OK) {
+        assert(info.runtime_present != 0u && info.initialized != 0u && info.library[0] != '\0');
+    } else {
+        assert(info.initialized == 0u);
+    }
+    lm_config config;
+    lm_config_init(&config);
+    config.backend = LM_BACKEND_ROCR;
+    lm_runtime *runtime = nullptr;
+    assert(lm_runtime_create(&config, &runtime) == LM_ERR_UNSUPPORTED);
+    assert(runtime == nullptr);
+}
+
 static void test_cli() {
     char a0[] = "tiny-lm";
     char a1[] = "--backend"; char a2[] = "cpu";
@@ -1697,6 +1714,7 @@ static void test_probe_and_runtime() {
 
 int main() {
     test_defaults();
+    test_rocr_probe();
     test_cli();
     test_quantize_policy_gate();
     test_vulkan_backend_resolution();

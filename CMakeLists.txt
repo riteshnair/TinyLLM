@@ -10,9 +10,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_library(lm_core STATIC core/lm.cpp core/model.cpp core/tensor.cpp core/file.cpp core/kv.cpp core/decoder.cpp core/moe.cpp core/kernel.cpp core/sampling.cpp)
+add_library(lm_core STATIC core/lm.cpp core/model.cpp core/tensor.cpp core/file.cpp core/kv.cpp core/decoder.cpp core/moe.cpp core/kernel.cpp core/sampling.cpp core/rocr.cpp)
 target_include_directories(lm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(lm_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+if(CMAKE_DL_LIBS)
+    target_link_libraries(lm_core PUBLIC ${CMAKE_DL_LIBS})
+endif()
 
 if(LM_ENABLE_VULKAN)
     find_package(Vulkan QUIET)
