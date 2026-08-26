@@ -485,7 +485,7 @@ static void test_model_bound_moe_q4_k() {
 
 static void test_safetensors_native_mlp() {
     const char *path = "test-native-f32.safetensors";
-    const char *json = "{\"token_embd.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,16]},\"output.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[16,32]},\"output_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[32,40]},\"blk.0.attn_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[40,48]},\"blk.0.attn_q.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[48,64]},\"blk.0.attn_k.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[64,80]},\"blk.0.attn_v.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[80,96]},\"blk.0.attn_output.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[96,112]},\"blk.0.ffn_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[112,120]},\"blk.0.ffn_gate.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[120,136]},\"blk.0.ffn_down.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[136,152]},\"blk.0.ffn_up.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[152,168]}}";
+    const char *json = "{\"__metadata__\":{\"general.architecture\":\"llama\",\"llama.context_length\":\"4\",\"llama.embedding_length\":\"2\",\"llama.block_count\":\"1\",\"llama.attention.head_count\":\"1\",\"llama.attention.head_count_kv\":\"1\",\"llama.feed_forward_length\":\"2\",\"llama.rope.freq_base\":\"10000\",\"tokenizer.token.0\":\"a\",\"tokenizer.token.1\":\"b\"},\"token_embd.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,16]},\"output.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[16,32]},\"output_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[32,40]},\"blk.0.attn_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[40,48]},\"blk.0.attn_q.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[48,64]},\"blk.0.attn_k.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[64,80]},\"blk.0.attn_v.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[80,96]},\"blk.0.attn_output.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[96,112]},\"blk.0.ffn_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[112,120]},\"blk.0.ffn_gate.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[120,136]},\"blk.0.ffn_down.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[136,152]},\"blk.0.ffn_up.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[152,168]}}";
     {
         std::ofstream file(path, std::ios::binary);
         const uint64_t header_bytes = std::strlen(json);
@@ -505,6 +505,27 @@ static void test_safetensors_native_mlp() {
     assert(lm_model_open(path, &model, error, sizeof(error)) == LM_OK);
     lm_decoder_graph_binding graph{};
     assert(lm_model_build_llama_graph(model, &graph) == LM_OK && graph.layer_count == 1u);
+    lm_model_architecture parsed_architecture{};
+    assert(lm_model_get_architecture(model, &parsed_architecture) == LM_OK);
+    assert(parsed_architecture.context_length == 4u && parsed_architecture.embedding_length == 2u &&
+           parsed_architecture.block_count == 1u && parsed_architecture.head_count == 1u &&
+           parsed_architecture.head_count_kv == 1u && parsed_architecture.intermediate_length == 2u &&
+           std::fabs(parsed_architecture.rope_frequency_base - 10000.0f) < 1.0e-3f);
+    uint32_t token_count = 0u;
+    assert(lm_model_token_count(model, &token_count) == LM_OK && token_count == 2u);
+    char token[8] = {};
+    size_t token_bytes = 0u;
+    assert(lm_model_token_at(model, 1u, token, sizeof(token), &token_bytes) == LM_OK &&
+           token_bytes == 1u && token[0] == 'b');
+    const char text[] = "ab";
+    uint32_t encoded[2] = {};
+    size_t encoded_count = 0u;
+    assert(lm_model_token_encode(model, text, 2u, encoded, 2u, &encoded_count) == LM_OK &&
+           encoded_count == 2u && encoded[0] == 0u && encoded[1] == 1u);
+    char decoded[8] = {};
+    size_t decoded_bytes = 0u;
+    assert(lm_model_token_decode(model, encoded, encoded_count, decoded, sizeof(decoded), &decoded_bytes) == LM_OK &&
+           decoded_bytes == 2u && std::memcmp(decoded, text, 2u) == 0);
     lm_native_mlp_config config{};
     config.matvec = {LM_BACKEND_CPU, 0u, nullptr};
     config.layer_index = 0u;
@@ -520,7 +541,15 @@ static void test_safetensors_native_mlp() {
     assert(std::fabs(logits[0] - scale) < 1.0e-5f && std::fabs(logits[1]) < 1.0e-5f);
     lm_native_mlp_config bad_backend = config;
     bad_backend.matvec.backend = LM_BACKEND_VULKAN;
-    assert(lm_model_execute_native_mlp_logits(model, &graph, &bad_backend, 0u, scratch, sizeof(scratch), logits, 2u) == LM_ERR_UNSUPPORTED);
+    bad_backend.matvec.shader_path = "dot_f32_scalar.comp.spv";
+    float backend_logits[2] = {};
+#if LM_HAS_VULKAN
+    assert(lm_model_execute_native_mlp_logits(model, &graph, &bad_backend, 0u, scratch, sizeof(scratch), backend_logits, 2u) == LM_OK);
+    assert(std::fabs(backend_logits[0] - logits[0]) < 1.0e-5f &&
+           std::fabs(backend_logits[1] - logits[1]) < 1.0e-5f);
+#else
+    assert(lm_model_execute_native_mlp_logits(model, &graph, &bad_backend, 0u, scratch, sizeof(scratch), backend_logits, 2u) == LM_ERR_UNSUPPORTED);
+#endif
     lm_native_transformer_config transformer{};
     transformer.step.matvec = config.matvec;
     transformer.step.layer_index = 0u;
@@ -556,7 +585,7 @@ static void test_safetensors_native_mlp() {
     transformer.has_architecture = 0u;
     assert(lm_model_execute_native_transformer(model, &graph, &transformer, 0u, layer_caches, 1u,
                                                transformer_page, scratch, sizeof(scratch),
-                                               transformer_logits, 2u) == LM_ERR_UNSUPPORTED);
+                                               transformer_logits, 2u) == LM_OK);
     lm_native_generation_config generation{};
     generation.step = transformer.step;
     generation.step.token_offset = 0u;
@@ -999,7 +1028,7 @@ static void test_safetensors_parser() {
     float output[2] = {};
     assert(lm_model_tensor_matvec_f32_cpu(model, 1u, matrix_scratch, sizeof(matrix_scratch),
                                           2u, 2u, input, output) == LM_OK);
-    assert(output[0] == 7.0f && output[1] == 10.0f);
+    assert(output[0] == 5.0f && output[1] == 11.0f);
     assert(lm_model_tensor_matvec_f32_cpu(model, 1u, matrix_scratch, sizeof(float),
                                           2u, 2u, input, output) == LM_ERR_CAPACITY);
     lm_model_close(model);

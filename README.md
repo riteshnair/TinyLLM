@@ -4,11 +4,11 @@ TinyLLM is a compact, Vulkan-first modular LLM inference engine with a strict C9
 
 ## Current validated slice
 
-The repository currently provides bounded GGUF/SafeTensors inspection, exact native GGML Q4_0/Q8_0/Q4_K storage contracts, lazy file-span bindings, replaceable Vulkan packed dot and matvec shaders, paged KV metadata plus bounded opaque payloads with copy-on-write, exact bounded GGUF vocabulary parsing, deterministic sampling, and a narrow native multi-layer path.
+The repository currently provides bounded GGUF/SafeTensors inspection, exact native GGML Q4_0/Q8_0/Q4_K storage contracts, SafeTensors metadata and contiguous token-string contracts, demand-paged file-span bindings, replaceable Vulkan packed and F32 scalar dot/matvec shaders, paged KV metadata plus bounded opaque payloads with copy-on-write, deterministic sampling, and a narrow native multi-layer path.
 
-The narrow path validates a multi-layer Llama metadata profile with two query heads and one KV head when every layer satisfies the same explicit shape and native-format contract; executes native Q8_0 MLP and attention operations; uses an explicit F32 KV payload per layer; produces logits; encodes a bounded prompt; and runs a bounded deterministic generation loop. It is exposed through the library API and the CLI’s `--generate` entrypoint. This is a real tested vertical slice, not arbitrary-checkpoint compatibility.
+The narrow GGUF path validates a multi-layer Llama metadata profile with two query heads and one KV head when every layer satisfies the same explicit shape and native-format contract; executes native Q8_0 MLP and attention operations; uses an explicit F32 KV payload per layer; produces logits; encodes a bounded prompt; and runs a bounded deterministic generation loop. SafeTensors additionally supports metadata-bound Llama scalar architecture, contiguous `tokenizer.token.N` vocabulary entries, exact F32 caller-scratch matrices, scalar Vulkan F32 matvec differentials, and CPU transformer/numeric-token generation. These are real tested vertical slices, not arbitrary-checkpoint compatibility.
 
-The engine deliberately returns named unsupported errors for capabilities outside the validated profile. Architecture families beyond the bounded Llama scalar contract, broader GQA variants, broad tokenizer semantics, quantized KV policy, model residency scheduling, full MoE graph/router integration, batching, streaming, server/WebUI integration, distributed execution, and future ROCr/HSA backends remain pending.
+The engine deliberately returns named unsupported errors for capabilities outside the validated profiles. Architecture families beyond the bounded Llama scalar contract, BPE/merge tokenizer semantics, tokenizer.json parsing, quantized KV policy, persistent device residency, sharding/prefetch scheduling, full MoE graph/router integration, batching, streaming, server/WebUI integration, distributed execution, and future ROCr/HSA backends remain pending.
 
 ## Build
 
@@ -50,12 +50,13 @@ The CLI accepts the narrow validated multi-layer GGUF profile and checks every l
 | `core/lm.cpp` | Configuration, backend selection, runtime and probes |
 | `core/model.cpp` | Bounded model inspection, exact vocabulary, and native model bindings |
 | `core/kv.cpp` | Paged KV metadata and bounded opaque payload COW |
-| `core/file.cpp` | Bounded read-only on-demand file access |
+| `core/file.cpp` | Bounded demand-paged or stream-backed file access |
 | `core/tensor.cpp` | Dtype, tensor-view, and host-buffer primitives |
 | `core/decoder.cpp` | Narrow native MLP, attention, logits, tokenizer bridge, and generation path |
 | `core/kernel.cpp` | Replaceable CPU/Vulkan/DP4 kernel registry |
 | `vulkan/device.cpp` | Vulkan device discovery |
 | `vulkan/dp4.cpp` | Reference packed-int8 DP4 dispatch |
+| `vulkan/matvec_f32.cpp` | SafeTensors F32 scalar Vulkan matvec route |
 | `vulkan/shaders/dot_i8_dp4.comp` | DP4 compute shader source |
 | `cli/main.cpp` | Local control CLI, device listing, and narrow multi-layer generation entrypoint |
 | `tests/test_core.cpp` | Focused unit and smoke tests |

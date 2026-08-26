@@ -244,6 +244,10 @@ lm_status lm_vulkan_matvec_q8_0(const char *spv_path, uint32_t device_index,
                                 const void *packed_q8_0, uint32_t rows,
                                 uint32_t blocks_per_row, const float *input,
                                 float *out);
+lm_status lm_vulkan_matvec_f32(const char *spv_path, uint32_t device_index,
+                               const float *matrix, uint32_t rows,
+                               uint32_t columns, const float *input,
+                               float *out);
 typedef struct lm_kv_cache lm_kv_cache;
 
 typedef struct lm_kv_stats {

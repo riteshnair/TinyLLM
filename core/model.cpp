@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -434,6 +435,7 @@ class JsonCursor {
 public:
     JsonCursor(const char *begin, const char *end) : p_(begin), end_(end) {}
     const char *position() const { return p_; }
+    const char *end() const { return end_; }
 
     void whitespace() { while (p_ < end_ && (*p_ == ' ' || *p_ == '\n' || *p_ == '\r' || *p_ == '\t')) ++p_; }
     bool character(char expected) { whitespace(); if (p_ >= end_ || *p_ != expected) return false; ++p_; return true; }
@@ -457,6 +459,17 @@ public:
             if (out->size() < max_length) out->push_back(static_cast<char>(c));
         }
         return false;
+    }
+
+    bool token(std::string *out, size_t max_length) {
+        whitespace();
+        if (p_ >= end_ || *p_ == ',' || *p_ == '}' || *p_ == ']') return false;
+        const char *start = p_;
+        while (p_ < end_ && *p_ != ',' && *p_ != '}' && *p_ != ']' &&
+               *p_ != ' ' && *p_ != '\n' && *p_ != '\r' && *p_ != '\t') ++p_;
+        if (p_ == start || static_cast<size_t>(p_ - start) > max_length) return false;
+        out->assign(start, p_);
+        return true;
     }
 
     bool unsigned_number(uint64_t *out) {
@@ -515,6 +528,80 @@ uint32_t safe_dtype_code(const std::string &dtype) {
     return 0xffffffffu;
 }
 
+bool parse_safe_u32(const std::string &text, uint32_t *out) {
+    if (!out || text.empty()) return false;
+    char *end = nullptr;
+    const unsigned long long value = std::strtoull(text.c_str(), &end, 10);
+    if (end != text.c_str() + text.size() || value == 0u || value > UINT32_MAX) return false;
+    *out = static_cast<uint32_t>(value);
+    return true;
+}
+
+bool parse_safe_float(const std::string &text, float *out) {
+    if (!out || text.empty()) return false;
+    char *end = nullptr;
+    const float value = std::strtof(text.c_str(), &end);
+    if (end != text.c_str() + text.size() || !std::isfinite(value) || value <= 0.0f) return false;
+    *out = value;
+    return true;
+}
+
+bool read_safetensors_metadata(JsonCursor &json, lm_model_architecture *architecture, bool *has_architecture,
+                               std::vector<std::string> *tokens) {
+    if (!architecture || !has_architecture || !json.character('{')) return false;
+    *has_architecture = false;
+    bool is_llama = false;
+    bool flags[7] = {};
+    std::vector<uint8_t> token_seen;
+    std::vector<std::string> ignored_tokens;
+    std::vector<std::string> *token_output = tokens ? tokens : &ignored_tokens;
+    json.whitespace();
+    if (json.position() < json.end() && *json.position() != '}') {
+        for (;;) {
+            std::string key;
+            if (!json.string(&key, 128u) || !json.character(':')) return false;
+            const char *token_prefix = "tokenizer.token.";
+            const size_t token_prefix_bytes = std::strlen(token_prefix);
+            const bool tokenizer_key = key.size() > token_prefix_bytes &&
+                                       key.compare(0u, token_prefix_bytes, token_prefix) == 0;
+            const bool known = key == "general.architecture" || key == "llama.context_length" ||
+                               key == "llama.embedding_length" || key == "llama.block_count" ||
+                               key == "llama.attention.head_count" || key == "llama.attention.head_count_kv" ||
+                               key == "llama.feed_forward_length" || key == "llama.rope.freq_base" || tokenizer_key;
+            if (known) {
+                std::string value;
+                if (!json.string(&value, tokenizer_key ? kMaxVocabularyTokenBytes : 64u)) return false;
+                if (tokenizer_key) {
+                    char *end = nullptr;
+                    const std::string suffix = key.substr(token_prefix_bytes);
+                    const unsigned long long index = std::strtoull(suffix.c_str(), &end, 10);
+                    if (suffix.empty() || end != suffix.c_str() + suffix.size() || index >= kMaxVocabularyTokens) return false;
+                    if (token_output->size() <= static_cast<size_t>(index)) token_output->resize(static_cast<size_t>(index) + 1u);
+                    if (token_seen.size() <= static_cast<size_t>(index)) token_seen.resize(static_cast<size_t>(index) + 1u, 0u);
+                    if (token_seen[static_cast<size_t>(index)] != 0u) return false;
+                    (*token_output)[static_cast<size_t>(index)] = value;
+                    token_seen[static_cast<size_t>(index)] = 1u;
+                } else if (key == "general.architecture") is_llama = value == "llama";
+                else if (key == "llama.context_length") { if (flags[0] || !parse_safe_u32(value, &architecture->context_length)) return false; flags[0] = true; }
+                else if (key == "llama.embedding_length") { if (flags[1] || !parse_safe_u32(value, &architecture->embedding_length)) return false; flags[1] = true; }
+                else if (key == "llama.block_count") { if (flags[2] || !parse_safe_u32(value, &architecture->block_count)) return false; flags[2] = true; }
+                else if (key == "llama.attention.head_count") { if (flags[3] || !parse_safe_u32(value, &architecture->head_count)) return false; flags[3] = true; }
+                else if (key == "llama.attention.head_count_kv") { if (flags[4] || !parse_safe_u32(value, &architecture->head_count_kv)) return false; flags[4] = true; }
+                else if (key == "llama.feed_forward_length") { if (flags[5] || !parse_safe_u32(value, &architecture->intermediate_length)) return false; flags[5] = true; }
+                else if (key == "llama.rope.freq_base") { if (flags[6] || !parse_safe_float(value, &architecture->rope_frequency_base)) return false; flags[6] = true; }
+            } else if (!json.skip_value(0u)) return false;
+            json.whitespace();
+            if (json.position() < json.end() && *json.position() == '}') { if (!json.consume('}')) return false; break; }
+            if (!json.character(',')) return false;
+        }
+    } else if (!json.consume('}')) return false;
+    for (size_t i = 0u; i < token_seen.size(); ++i) if (token_seen[i] == 0u) return false;
+    *has_architecture = is_llama && flags[0] && flags[1] && flags[2] && flags[3] && flags[4] && flags[5] && flags[6] &&
+                        architecture->head_count_kv <= architecture->head_count &&
+                        architecture->embedding_length % architecture->head_count == 0u;
+    return true;
+}
+
 uint64_t safe_dtype_bytes(const std::string &dtype, uint64_t elements, bool *known) {
     uint64_t element_bytes = 0u;
     if (dtype == "BOOL" || dtype == "U8" || dtype == "I8" || dtype == "F8_E4M3" || dtype == "F8_E5M2") element_bytes = 1u;
@@ -531,7 +618,9 @@ uint64_t safe_dtype_bytes(const std::string &dtype, uint64_t elements, bool *kno
 }
 
 lm_status inspect_safetensors(const char *path, lm_model_info *out_info, char *error_text, size_t error_capacity,
-                              std::vector<lm_model_tensor_info> *out_tensors = nullptr) {
+                              std::vector<lm_model_tensor_info> *out_tensors = nullptr,
+                              std::vector<std::string> *out_tokens = nullptr,
+                              lm_model_architecture *out_architecture = nullptr) {
     BinaryReader reader(path);
     if (!reader.good()) { set_error(error_text, error_capacity, "cannot open model file"); return LM_ERR_IO; }
     if (reader.size() < 8u) { set_error(error_text, error_capacity, "SafeTensors header length is truncated"); return LM_ERR_PARSE; }
@@ -542,6 +631,9 @@ lm_status inspect_safetensors(const char *path, lm_model_info *out_info, char *e
     std::vector<char> header(static_cast<size_t>(header_bytes));
     if (!reader.read(header.data(), header_bytes)) { set_error(error_text, error_capacity, "cannot read SafeTensors header"); return LM_ERR_IO; }
     JsonCursor json(header.data(), header.data() + header.size());
+    if (out_architecture) *out_architecture = lm_model_architecture{};
+    lm_model_architecture metadata_architecture{};
+    bool has_metadata_architecture = false;
     if (!json.character('{')) { set_error(error_text, error_capacity, "SafeTensors header is not a JSON object"); return LM_ERR_PARSE; }
     struct Range { uint64_t begin; uint64_t end; };
     std::vector<Range> ranges;
@@ -551,7 +643,9 @@ lm_status inspect_safetensors(const char *path, lm_model_info *out_info, char *e
             std::string name;
             if (!json.string(&name, 1u << 20u) || !json.character(':')) { set_error(error_text, error_capacity, "invalid SafeTensors key"); return LM_ERR_PARSE; }
             if (name == "__metadata__") {
-                if (!json.skip_value(0u)) { set_error(error_text, error_capacity, "invalid SafeTensors metadata"); return LM_ERR_PARSE; }
+                if (!read_safetensors_metadata(json, &metadata_architecture, &has_metadata_architecture, out_tokens)) {
+                    set_error(error_text, error_capacity, "invalid SafeTensors metadata"); return LM_ERR_PARSE;
+                }
             } else {
                 if (!json.character('{')) { set_error(error_text, error_capacity, "SafeTensors tensor descriptor is not an object"); return LM_ERR_PARSE; }
                 bool have_dtype = false, have_shape = false, have_offsets = false;
@@ -630,6 +724,7 @@ lm_status inspect_safetensors(const char *path, lm_model_info *out_info, char *e
     out_info->file_bytes = reader.size();
     out_info->header_bytes = 8u + header_bytes;
     out_info->tensor_count = ranges.size();
+    if (out_architecture && has_metadata_architecture) *out_architecture = metadata_architecture;
     return LM_OK;
 }
 
@@ -672,7 +767,7 @@ lm_status lm_model_open(const char *path, lm_model_file **out_model, char *error
         const lm_status descriptors = inspect_gguf(path, &info, error_text, error_capacity, &tensors, &tokens, &architecture);
         if (descriptors != LM_OK) return descriptors;
     } else if (info.format == LM_MODEL_SAFETENSORS) {
-        const lm_status descriptors = inspect_safetensors(path, &info, error_text, error_capacity, &tensors);
+        const lm_status descriptors = inspect_safetensors(path, &info, error_text, error_capacity, &tensors, &tokens, &architecture);
         if (descriptors != LM_OK) return descriptors;
     }
     const lm_status opened = lm_file_open(path, &file);
@@ -886,11 +981,12 @@ lm_status lm_model_tensor_matvec_f32_cpu(const lm_model_file *model, uint64_t te
     status = lm_file_span_read(&span, 0u, matrix_scratch, static_cast<size_t>(bytes));
     if (status != LM_OK) return status;
     const float *matrix = static_cast<const float *>(matrix_scratch);
-    for (uint32_t column = 0u; column < columns; ++column) {
+    for (uint32_t row = 0u; row < rows; ++row) {
         float sum = 0.0f;
-        for (uint32_t row = 0u; row < rows; ++row) sum += input[row] * matrix[static_cast<size_t>(row) * columns + column];
+        for (uint32_t column = 0u; column < columns; ++column)
+            sum += input[column] * matrix[static_cast<size_t>(row) * columns + column];
         if (!std::isfinite(sum)) return LM_ERR_RANGE;
-        out[column] = sum;
+        out[row] = sum;
     }
     return LM_OK;
 }

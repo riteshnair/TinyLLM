@@ -192,9 +192,25 @@ lm_status profile_matvec(const lm_model_file *model, uint64_t index,
     const lm_status described = lm_model_tensor_info_at(model, index, &descriptor);
     if (described != LM_OK) return described;
     if (descriptor.type == LM_DTYPE_F32) {
-        if (config->backend == LM_BACKEND_VULKAN) return LM_ERR_UNSUPPORTED;
-        return lm_model_tensor_matvec_f32_cpu(model, index, packed_scratch, packed_scratch_bytes,
-                                              rows, columns, input, out);
+        if (!model || !packed_scratch || !input || !out || rows == 0u || columns == 0u ||
+            static_cast<uint64_t>(rows) > UINT64_MAX / columns) return LM_ERR_ARGUMENT;
+        const uint64_t elements = static_cast<uint64_t>(rows) * columns;
+        if (elements > UINT64_MAX / sizeof(float)) return LM_ERR_CAPACITY;
+        const uint64_t bytes = elements * sizeof(float);
+        if (bytes > packed_scratch_bytes || bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) return LM_ERR_CAPACITY;
+        if (config->backend == LM_BACKEND_VULKAN) {
+            lm_file_span span{};
+            lm_status status = lm_model_tensor_span(model, descriptor.relative_offset, bytes, &span);
+            if (status != LM_OK) return status;
+            status = lm_file_span_read(&span, 0u, packed_scratch, static_cast<size_t>(bytes));
+            if (status != LM_OK) return status;
+            return lm_vulkan_matvec_f32(config->shader_path, config->device_index,
+                                        static_cast<const float *>(packed_scratch), rows, columns, input, out);
+        }
+        if (config->backend == LM_BACKEND_CPU)
+            return lm_model_tensor_matvec_f32_cpu(model, index, packed_scratch, packed_scratch_bytes,
+                                                  rows, columns, input, out);
+        return LM_ERR_UNSUPPORTED;
     }
     return lm_model_tensor_matvec_native(model, index, config, packed_scratch,
                                          packed_scratch_bytes, rows, columns, input, out);
