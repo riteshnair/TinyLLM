@@ -645,6 +645,21 @@ lm_status lm_cpu_moe_selected_expert_mlp_q4_k(const lm_moe_route *route,
                                               const lm_tensor *down_weights,
                                               uint32_t hidden_size, uint32_t intermediate_size,
                                               const float *input, float *selected_outputs);
+/* Stages only selected Mixtral experts from exact lazy Q4_K spans; Vulkan routing is not implied. */
+lm_status lm_model_moe_selected_expert_mlp_q4_k(const lm_model_file *model,
+                                                uint64_t gate_up_tensor,
+                                                uint64_t down_tensor,
+                                                const lm_moe_route *route,
+                                                uint32_t expected_layer,
+                                                uint32_t hidden_size,
+                                                uint32_t intermediate_size,
+                                                void *gate_up_scratch,
+                                                uint64_t gate_up_scratch_bytes,
+                                                void *down_scratch,
+                                                uint64_t down_scratch_bytes,
+                                                const float *input,
+                                                float *selected_outputs,
+                                                size_t selected_outputs_count);
 
 lm_status lm_kv_cache_create(uint32_t page_count, uint32_t page_tokens,
                              lm_kv_cache **out_cache);

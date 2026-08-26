@@ -393,6 +393,96 @@ static void test_native_model_tensor_binding() {
     std::remove(bad_path);
 }
 
+static void test_model_bound_moe_q4_k() {
+    const uint32_t hidden = 256u;
+    const uint32_t intermediate = 256u;
+    const uint32_t experts = 2u;
+    const uint64_t gate_expert_bytes = 512ull * 144u;
+    const uint64_t down_expert_bytes = 256ull * 144u;
+    const uint64_t gate_tensor_bytes = gate_expert_bytes * experts;
+    const uint64_t down_tensor_bytes = down_expert_bytes * experts;
+    auto put_u32 = [](std::vector<unsigned char> *bytes, uint32_t value) {
+        for (unsigned i = 0u; i < 4u; ++i) bytes->push_back(static_cast<unsigned char>((value >> (8u * i)) & 0xffu));
+    };
+    auto put_u64 = [](std::vector<unsigned char> *bytes, uint64_t value) {
+        for (unsigned i = 0u; i < 8u; ++i) bytes->push_back(static_cast<unsigned char>((value >> (8u * i)) & 0xffu));
+    };
+    auto put_rank3 = [&put_u32, &put_u64](std::vector<unsigned char> *bytes, const char *name,
+                                            uint64_t first_dimension, uint64_t second_dimension,
+                                            uint64_t offset) {
+        const size_t length = std::strlen(name);
+        put_u64(bytes, length);
+        bytes->insert(bytes->end(), name, name + length);
+        put_u32(bytes, 3u);
+        put_u64(bytes, first_dimension);
+        put_u64(bytes, second_dimension);
+        put_u64(bytes, 2u);
+        put_u32(bytes, 12u);
+        put_u64(bytes, offset);
+    };
+    std::vector<unsigned char> gguf(24u, 0u);
+    gguf[0] = 'G'; gguf[1] = 'G'; gguf[2] = 'U'; gguf[3] = 'F'; gguf[4] = 3u; gguf[8] = 2u;
+    put_rank3(&gguf, "layers.0.feed_forward.experts.w1", hidden, intermediate * 2u, 0u);
+    put_rank3(&gguf, "layers.0.feed_forward.experts.w2", intermediate, hidden, gate_tensor_bytes);
+    const size_t header_size = (gguf.size() + 31u) & ~static_cast<size_t>(31u);
+    gguf.resize(header_size + static_cast<size_t>(gate_tensor_bytes + down_tensor_bytes), 0u);
+    for (uint32_t tensor = 0u; tensor < 2u; ++tensor) {
+        const size_t tensor_base = header_size + static_cast<size_t>(tensor == 0u ? 0u : gate_tensor_bytes);
+        const uint64_t tensor_expert_bytes = tensor == 0u ? gate_expert_bytes : down_expert_bytes;
+        const uint32_t tensor_blocks = tensor == 0u ? 512u : 256u;
+        for (uint32_t expert = 0u; expert < experts; ++expert) {
+            const unsigned char nibble = static_cast<unsigned char>(expert == 0u ? 0x11u : 0x22u);
+            const size_t expert_base = tensor_base + static_cast<size_t>(expert * tensor_expert_bytes);
+            for (uint32_t block = 0u; block < tensor_blocks; ++block) {
+                unsigned char *base = gguf.data() + expert_base + static_cast<size_t>(block) * 144u;
+                base[1] = 0x3cu;
+                for (uint32_t i = 0u; i < 4u; ++i) base[4u + i] = 1u;
+                for (uint32_t i = 0u; i < 4u; ++i) base[12u + i] = 1u;
+                for (uint32_t i = 0u; i < 128u; ++i) base[16u + i] = nibble;
+            }
+        }
+    }
+    const char *path = "test-model-bound-moe.gguf";
+    {
+        std::ofstream file(path, std::ios::binary);
+        file.write(reinterpret_cast<const char *>(gguf.data()), static_cast<std::streamsize>(gguf.size()));
+    }
+    lm_model_file *model = nullptr;
+    char error[128] = {};
+    assert(lm_model_open(path, &model, error, sizeof(error)) == LM_OK);
+    lm_moe_route route{};
+    route.expert_count = experts;
+    route.experts_per_token = 1u;
+    route.selected[0] = 1u;
+    route.weights[0] = 1.0f;
+    std::vector<unsigned char> expected_gate(static_cast<size_t>(gate_tensor_bytes));
+    std::vector<unsigned char> expected_down(static_cast<size_t>(down_tensor_bytes));
+    std::memcpy(expected_gate.data(), gguf.data() + header_size, static_cast<size_t>(gate_tensor_bytes));
+    std::memcpy(expected_down.data(), gguf.data() + header_size + gate_tensor_bytes, static_cast<size_t>(down_tensor_bytes));
+    const uint32_t gate_dims[3] = {hidden, intermediate * 2u, experts};
+    const uint32_t down_dims[3] = {intermediate, hidden, experts};
+    lm_tensor expected_gate_tensor{};
+    lm_tensor expected_down_tensor{};
+    assert(lm_tensor_make_q4_k_view(expected_gate.data(), expected_gate.size(), 3u, gate_dims, &expected_gate_tensor) == LM_OK);
+    assert(lm_tensor_make_q4_k_view(expected_down.data(), expected_down.size(), 3u, down_dims, &expected_down_tensor) == LM_OK);
+    std::vector<float> input(hidden, 1.0f);
+    std::vector<float> expected(hidden, 0.0f);
+    assert(lm_cpu_moe_selected_expert_mlp_q4_k(&route, &expected_gate_tensor, &expected_down_tensor,
+                                               hidden, intermediate, input.data(), expected.data()) == LM_OK);
+    std::vector<unsigned char> gate_scratch(static_cast<size_t>(gate_expert_bytes));
+    std::vector<unsigned char> down_scratch(static_cast<size_t>(down_expert_bytes));
+    std::vector<float> actual(hidden, 0.0f);
+    assert(lm_model_moe_selected_expert_mlp_q4_k(model, 0u, 1u, &route, 0u, hidden, intermediate,
+                                                 gate_scratch.data(), gate_scratch.size(), down_scratch.data(),
+                                                 down_scratch.size(), input.data(), actual.data(), actual.size()) == LM_OK);
+    for (uint32_t i = 0u; i < hidden; ++i) assert(actual[i] == expected[i]);
+    assert(lm_model_moe_selected_expert_mlp_q4_k(model, 0u, 1u, &route, 0u, hidden, intermediate,
+                                                 gate_scratch.data(), gate_scratch.size() - 1u, down_scratch.data(),
+                                                 down_scratch.size(), input.data(), actual.data(), actual.size()) == LM_ERR_CAPACITY);
+    lm_model_close(model);
+    std::remove(path);
+}
+
 static void test_safetensors_native_mlp() {
     const char *path = "test-native-f32.safetensors";
     const char *json = "{\"token_embd.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,16]},\"output.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[16,32]},\"output_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[32,40]},\"blk.0.attn_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[40,48]},\"blk.0.attn_q.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[48,64]},\"blk.0.attn_k.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[64,80]},\"blk.0.attn_v.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[80,96]},\"blk.0.attn_output.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[96,112]},\"blk.0.ffn_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[112,120]},\"blk.0.ffn_gate.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[120,136]},\"blk.0.ffn_down.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[136,152]},\"blk.0.ffn_up.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[152,168]}}";
@@ -1128,8 +1218,8 @@ static void test_kv_payload() {
     assert(lm_kv_cache_create(1u, 2u, &metadata_only) == LM_OK);
     uint32_t metadata_page = UINT32_MAX;
     assert(lm_kv_cache_append(metadata_only, &metadata_page, 1u) == LM_OK);
-    const unsigned char one_key = 1u;
-    const unsigned char one_value = 2u;
+    const unsigned char one_key[3] = {1u, 1u, 1u};
+    const unsigned char one_value[2] = {2u, 2u};
     assert(lm_kv_cache_write_payload(metadata_only, metadata_page, 0u, 1u,
                                      &one_key, &one_value) == LM_ERR_UNSUPPORTED);
     lm_kv_cache_destroy(metadata_only);
@@ -1169,7 +1259,7 @@ static void test_kv_payload() {
     assert(lm_kv_cache_append(cache, &reused, 1u) == LM_OK);
     assert(lm_kv_cache_write_payload(cache, reused, 0u, 1u, &one_key, &one_value) == LM_OK);
     assert(lm_kv_cache_read_payload(cache, reused, 0u, 1u, read_keys, read_values) == LM_OK);
-    assert(read_keys[0] == one_key && read_values[0] == one_value);
+    assert(read_keys[0] == one_key[0] && read_values[0] == one_value[0]);
     assert(lm_kv_cache_release(cache, reused) == LM_OK);
     lm_kv_cache_destroy(cache);
 
@@ -1326,6 +1416,7 @@ int main() {
     test_tensor_and_buffer();
     test_file_access();
     test_native_model_tensor_binding();
+    test_model_bound_moe_q4_k();
     test_native_mlp_profile();
     test_model_and_cpu_math();
     test_safetensors_parser();

@@ -26,6 +26,12 @@ constexpr uint64_t kMaxContainerItems = 1ull << 20u;
 constexpr uint64_t kMaxVocabularyTokens = 65536u;
 constexpr uint64_t kMaxVocabularyTokenBytes = 256u;
 
+bool finite_array(const float *data, size_t count) {
+    if (!data) return false;
+    for (size_t i = 0u; i < count; ++i) if (!std::isfinite(data[i])) return false;
+    return true;
+}
+
 void set_error(char *dst, size_t cap, const char *text) {
     if (!dst || cap == 0u) return;
     std::strncpy(dst, text, cap - 1u);
@@ -885,6 +891,102 @@ lm_status lm_model_tensor_matvec_f32_cpu(const lm_model_file *model, uint64_t te
         for (uint32_t row = 0u; row < rows; ++row) sum += input[row] * matrix[static_cast<size_t>(row) * columns + column];
         if (!std::isfinite(sum)) return LM_ERR_RANGE;
         out[column] = sum;
+    }
+    return LM_OK;
+}
+
+lm_status lm_model_moe_selected_expert_mlp_q4_k(const lm_model_file *model,
+                                                uint64_t gate_up_tensor,
+                                                uint64_t down_tensor,
+                                                const lm_moe_route *route,
+                                                uint32_t expected_layer,
+                                                uint32_t hidden_size,
+                                                uint32_t intermediate_size,
+                                                void *gate_up_scratch,
+                                                uint64_t gate_up_scratch_bytes,
+                                                void *down_scratch,
+                                                uint64_t down_scratch_bytes,
+                                                const float *input,
+                                                float *selected_outputs,
+                                                size_t selected_outputs_count) {
+    if (!model || !route || !gate_up_scratch || !down_scratch || !input || !selected_outputs ||
+        route->expert_count == 0u || route->experts_per_token == 0u || route->experts_per_token > 16u ||
+        hidden_size == 0u || intermediate_size == 0u || hidden_size % 256u != 0u ||
+        intermediate_size % 256u != 0u || selected_outputs_count <
+        static_cast<size_t>(route->experts_per_token) * hidden_size) return LM_ERR_ARGUMENT;
+    if (!finite_array(input, hidden_size)) return LM_ERR_RANGE;
+    lm_model_tensor_info gate_descriptor{};
+    lm_model_tensor_info down_descriptor{};
+    lm_status status = lm_model_tensor_info_at(model, gate_up_tensor, &gate_descriptor);
+    if (status != LM_OK) return status;
+    status = lm_model_tensor_info_at(model, down_tensor, &down_descriptor);
+    if (status != LM_OK) return status;
+    lm_moe_tensor_mapping gate_mapping{};
+    lm_moe_tensor_mapping down_mapping{};
+    status = lm_moe_map_mixtral_tensor(&gate_descriptor, route->expert_count, &gate_mapping);
+    if (status != LM_OK) return status;
+    status = lm_moe_map_mixtral_tensor(&down_descriptor, route->expert_count, &down_mapping);
+    if (status != LM_OK) return status;
+    if (gate_mapping.role != LM_MOE_TENSOR_GATE_UP_EXPERT ||
+        down_mapping.role != LM_MOE_TENSOR_DOWN_EXPERT || gate_mapping.layer_index != expected_layer ||
+        down_mapping.layer_index != expected_layer || gate_descriptor.dims[0] != hidden_size ||
+        gate_descriptor.dims[1] != static_cast<uint64_t>(intermediate_size) * 2u ||
+        down_descriptor.dims[0] != intermediate_size || down_descriptor.dims[1] != hidden_size)
+        return LM_ERR_UNSUPPORTED;
+    lm_model_tensor_binding gate_binding{};
+    lm_model_tensor_binding down_binding{};
+    status = lm_model_tensor_bind_native(model, gate_up_tensor, &gate_binding);
+    if (status != LM_OK) return status;
+    status = lm_model_tensor_bind_native(model, down_tensor, &down_binding);
+    if (status != LM_OK) return status;
+    if (gate_binding.quant_format != LM_QUANT_GGML_Q4_K || down_binding.quant_format != LM_QUANT_GGML_Q4_K ||
+        gate_binding.span.bytes % route->expert_count != 0u || down_binding.span.bytes % route->expert_count != 0u)
+        return LM_ERR_UNSUPPORTED;
+    const uint64_t gate_expert_bytes = gate_binding.span.bytes / route->expert_count;
+    const uint64_t down_expert_bytes = down_binding.span.bytes / route->expert_count;
+    if (gate_expert_bytes > gate_up_scratch_bytes || down_expert_bytes > down_scratch_bytes ||
+        gate_expert_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        down_expert_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) return LM_ERR_CAPACITY;
+    std::vector<float> gate_up_output;
+    std::vector<float> activation;
+    try {
+        gate_up_output.assign(static_cast<size_t>(intermediate_size) * 2u, 0.0f);
+        activation.assign(intermediate_size, 0.0f);
+    } catch (const std::bad_alloc &) {
+        return LM_ERR_CAPACITY;
+    }
+    const uint32_t gate_dims[2] = {intermediate_size * 2u, hidden_size};
+    const uint32_t down_dims[2] = {hidden_size, intermediate_size};
+    for (uint32_t slot = 0u; slot < route->experts_per_token; ++slot) {
+        const uint32_t expert = route->selected[slot];
+        if (expert >= route->expert_count || !std::isfinite(route->weights[slot])) return LM_ERR_RANGE;
+        const uint64_t gate_offset = static_cast<uint64_t>(expert) * gate_expert_bytes;
+        const uint64_t down_offset = static_cast<uint64_t>(expert) * down_expert_bytes;
+        status = lm_file_span_read(&gate_binding.span, gate_offset, gate_up_scratch,
+                                   static_cast<size_t>(gate_expert_bytes));
+        if (status != LM_OK) return status;
+        status = lm_file_span_read(&down_binding.span, down_offset, down_scratch,
+                                   static_cast<size_t>(down_expert_bytes));
+        if (status != LM_OK) return status;
+        lm_tensor gate_view{};
+        lm_tensor down_view{};
+        status = lm_tensor_make_q4_k_view(gate_up_scratch, gate_expert_bytes, 2u, gate_dims, &gate_view);
+        if (status != LM_OK) return status;
+        status = lm_tensor_make_q4_k_view(down_scratch, down_expert_bytes, 2u, down_dims, &down_view);
+        if (status != LM_OK) return status;
+        status = lm_cpu_matvec_q4_k(&gate_view, input, intermediate_size * 2u, hidden_size,
+                                    gate_up_output.data());
+        if (status != LM_OK) return status;
+        for (uint32_t i = 0u; i < intermediate_size; ++i) {
+            const float gate = gate_up_output[i];
+            const float up = gate_up_output[intermediate_size + i];
+            activation[i] = (gate / (1.0f + std::exp(-gate))) * up;
+            if (!std::isfinite(activation[i])) return LM_ERR_RANGE;
+        }
+        float *output = selected_outputs + static_cast<size_t>(slot) * hidden_size;
+        status = lm_cpu_matvec_q4_k(&down_view, activation.data(), hidden_size, intermediate_size, output);
+        if (status != LM_OK) return status;
+        if (!finite_array(output, hidden_size)) return LM_ERR_RANGE;
     }
     return LM_OK;
 }
