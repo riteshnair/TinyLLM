@@ -234,6 +234,25 @@ lm_status profile_mlp_hidden(const lm_model_file *model, const lm_decoder_graph_
     return finite_array(out, config->hidden_size) ? LM_OK : LM_ERR_RANGE;
 }
 
+lm_status validate_transformer_architecture(const lm_model_file *model,
+                                             const lm_decoder_graph_binding *graph,
+                                             const lm_native_transformer_config *config) {
+    if (!model || !graph || !config) return LM_ERR_ARGUMENT;
+    lm_model_architecture architecture{};
+    const lm_status status = lm_model_get_architecture(model, &architecture);
+    if (status != LM_OK) return status;
+    if (architecture.block_count != graph->layer_count ||
+        architecture.embedding_length != config->step.hidden_size ||
+        architecture.intermediate_length != config->step.intermediate_size ||
+        architecture.head_count != 1u || architecture.head_count_kv != 1u ||
+        architecture.context_length == 0u || config->step.token_offset >= architecture.context_length)
+        return LM_ERR_UNSUPPORTED;
+    if (config->step.use_rope != 0u &&
+        std::fabs(config->step.rope_theta - architecture.rope_frequency_base) > 1.0e-4f)
+        return LM_ERR_UNSUPPORTED;
+    return LM_OK;
+}
+
 } // namespace
 
 lm_status lm_model_execute_native_mlp_logits(const lm_model_file *model,
@@ -536,6 +555,8 @@ lm_status lm_model_execute_native_transformer(const lm_model_file *model,
         (config->step.matrix_format != LM_QUANT_GGML_Q8_0 &&
          config->step.matrix_format != LM_QUANT_GGML_Q4_K))
         return LM_ERR_ARGUMENT;
+    const lm_status architecture_status = validate_transformer_architecture(model, graph, config);
+    if (architecture_status != LM_OK) return architecture_status;
     for (uint32_t layer = 0u; layer < graph->layer_count; ++layer)
         if (!layer_caches[layer]) return LM_ERR_ARGUMENT;
     uint64_t payload = 0u;
