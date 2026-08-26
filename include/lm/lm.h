@@ -454,19 +454,64 @@ lm_status lm_cpu_softmax_f32(const float *input, float *output, size_t count);
 
 typedef enum lm_sampling_mode {
     LM_SAMPLING_GREEDY = 0,
-    LM_SAMPLING_TOP_K
+    LM_SAMPLING_TOP_K,
+    LM_SAMPLING_TOP_P,
+    LM_SAMPLING_TYPICAL
 } lm_sampling_mode;
+
+typedef lm_status (*lm_logits_processor)(void *user, float *logits, uint32_t vocab_size,
+                                          const uint32_t *history_tokens, size_t history_count);
 
 typedef struct lm_sampling_config {
     lm_sampling_mode mode;
     uint32_t top_k;
     float temperature;
     uint64_t seed;
+    float top_p;
+    float min_p;
+    float typical_p;
+    float repetition_penalty;
+    float frequency_penalty;
+    float presence_penalty;
+    const uint32_t *history_tokens;
+    size_t history_count;
+    lm_logits_processor processor;
+    void *processor_user;
 } lm_sampling_config;
 
+void lm_sampling_config_init(lm_sampling_config *config);
 lm_status lm_sample_logits(const float *logits, uint32_t vocab_size,
                            const lm_sampling_config *config, uint32_t *out_token,
                            float *out_probability);
+
+typedef struct lm_ngram_speculative_config {
+    uint32_t min_n;
+    uint32_t max_n;
+    uint32_t max_draft_tokens;
+} lm_ngram_speculative_config;
+
+typedef struct lm_speculative_stats {
+    uint64_t proposed_tokens;
+    uint64_t accepted_tokens;
+    uint64_t rejected_tokens;
+    uint64_t verification_steps;
+} lm_speculative_stats;
+
+/* Finds a repeated suffix in caller-owned history and proposes the following tokens. */
+lm_status lm_speculative_ngram_propose(const uint32_t *history_tokens, size_t history_count,
+                                       const lm_ngram_speculative_config *config,
+                                       uint32_t *out_tokens, size_t token_capacity,
+                                       size_t *out_count);
+/* Verifies draft tokens against target greedy logits. Logit rows are draft_count + 1. */
+lm_status lm_speculative_verify_greedy(const uint32_t *draft_tokens, size_t draft_count,
+                                       const float *target_logits, size_t target_stride,
+                                       uint32_t vocab_size, uint32_t *out_tokens,
+                                       size_t token_capacity, size_t *out_count,
+                                       lm_speculative_stats *stats);
+/* Adjusts proposal depth from observed acceptance without exceeding configured bounds. */
+lm_status lm_speculative_adaptive_depth(const lm_speculative_stats *stats,
+                                        uint32_t current_depth, uint32_t min_depth,
+                                        uint32_t max_depth, uint32_t *out_depth);
 lm_status lm_cpu_dot_q4_0(const lm_tensor *weights, const float *input,
                           uint64_t elements, float *out);
 lm_status lm_cpu_dot_q8_0(const lm_tensor *weights, const float *input,
@@ -764,6 +809,8 @@ typedef struct lm_native_generation_config {
     /* When set, generation allocates typed KV pages with this CPU codec; otherwise it preserves opaque F32 payload compatibility. */
     lm_kv_dtype kv_dtype;
     uint8_t use_typed_kv;
+    const char *stop_strings[4];
+    uint32_t stop_string_count;
 } lm_native_generation_config;
 
 typedef lm_status (*lm_native_token_callback)(void *user, uint32_t token_id, float probability);
@@ -879,6 +926,48 @@ lm_status lm_kv_cache_write_f32(lm_kv_cache *cache, uint32_t page_id,
 lm_status lm_kv_cache_read_f32(const lm_kv_cache *cache, uint32_t page_id,
                                uint32_t token_offset, uint32_t token_count,
                                float *keys, float *values);
+
+typedef struct lm_prefix_cache lm_prefix_cache;
+typedef struct lm_prefix_cache_stats {
+    uint32_t entries;
+    uint32_t max_entries;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+} lm_prefix_cache_stats;
+/* Stores committed KV page identities; the prefix cache never owns or releases page IDs. */
+lm_status lm_prefix_cache_create(uint32_t max_entries, uint32_t max_tokens,
+                                 lm_prefix_cache **out_cache);
+void lm_prefix_cache_destroy(lm_prefix_cache *cache);
+lm_status lm_prefix_cache_insert(lm_prefix_cache *cache, uint64_t model_identity,
+                                 uint64_t settings_identity, const uint32_t *tokens,
+                                 size_t token_count, uint32_t page_id);
+lm_status lm_prefix_cache_lookup(lm_prefix_cache *cache, uint64_t model_identity,
+                                 uint64_t settings_identity, const uint32_t *tokens,
+                                 size_t token_count, uint32_t *out_page_id,
+                                 size_t *out_prefix_tokens);
+lm_status lm_prefix_cache_erase_page(lm_prefix_cache *cache, uint32_t page_id);
+lm_status lm_prefix_cache_get_stats(const lm_prefix_cache *cache, lm_prefix_cache_stats *out_stats);
+
+typedef struct lm_batch_scheduler lm_batch_scheduler;
+typedef struct lm_batch_scheduler_stats {
+    uint32_t active;
+    uint32_t capacity;
+    uint64_t submitted;
+    uint64_t completed;
+    uint64_t cancelled;
+    uint64_t steps;
+} lm_batch_scheduler_stats;
+typedef lm_status (*lm_batch_step_callback)(void *user, uint32_t request_id,
+                                             uint32_t *out_token, uint8_t *out_finished);
+lm_status lm_batch_scheduler_create(uint32_t capacity, lm_batch_scheduler **out_scheduler);
+void lm_batch_scheduler_destroy(lm_batch_scheduler *scheduler);
+lm_status lm_batch_scheduler_submit(lm_batch_scheduler *scheduler, uint32_t request_id);
+lm_status lm_batch_scheduler_cancel(lm_batch_scheduler *scheduler, uint32_t request_id);
+lm_status lm_batch_scheduler_step(lm_batch_scheduler *scheduler, lm_batch_step_callback callback,
+                                  void *user, uint32_t *out_stepped);
+lm_status lm_batch_scheduler_get_stats(const lm_batch_scheduler *scheduler,
+                                       lm_batch_scheduler_stats *out_stats);
 
 lm_status lm_runtime_create(const lm_config *config, lm_runtime **out_runtime);
 void lm_runtime_destroy(lm_runtime *runtime);

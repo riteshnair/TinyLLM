@@ -6,6 +6,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <fstream>
 #if defined(__unix__) || defined(__APPLE__)
@@ -25,6 +26,9 @@ static void print_help() {
     std::puts("  --kv-page-tokens N --trace --deterministic --no-prefetch");
     std::puts("  --dump-config --dry-run --list-devices --help");
     std::puts("  --generate --prompt TEXT --max-new-tokens N");
+    std::puts("  --sampling greedy|top-k|top-p|typical --top-k N --top-p P --min-p P");
+    std::puts("  --typical-p P --temperature T --repetition-penalty P --frequency-penalty P");
+    std::puts("  --presence-penalty P --seed N");
     std::puts("  --tokenizer PATH --config PATH (required for standard HF SafeTensors)");
     std::puts("  --server --port N --model PATH");
 }
@@ -41,6 +45,15 @@ static bool parse_bounded_u32(const char *text, uint32_t *out) {
     const unsigned long value = std::strtoul(text, &end, 10);
     if (!end || *end != '\0' || value > 1024u) return false;
     *out = static_cast<uint32_t>(value);
+    return true;
+}
+
+static bool parse_finite_float(const char *text, float *out) {
+    if (!text || !out || text[0] == '\0') return false;
+    char *end = nullptr;
+    const float value = std::strtof(text, &end);
+    if (!end || *end != '\0' || !std::isfinite(value)) return false;
+    *out = value;
     return true;
 }
 
@@ -113,6 +126,7 @@ struct http_stream_state {
 struct generation_assets {
     const char *tokenizer_path;
     const char *config_path;
+    lm_sampling_config sampling;
 };
 
 static lm_status run_native_generation(const lm_config &config, const generation_assets &assets,
@@ -317,7 +331,7 @@ static lm_status run_native_generation(const lm_config &config, const generation
     generation.architecture = architecture;
     generation.kv_dtype = config.kv_dtype;
     generation.use_typed_kv = execution_backend == LM_BACKEND_CPU ? 1u : 0u;
-    generation.sampling = {LM_SAMPLING_GREEDY, 0u, 1.0f, 1u};
+    generation.sampling = assets.sampling;
     generation.max_new_tokens = max_new_tokens;
     size_t generated_bytes = 0u;
     if (callback) {
@@ -627,6 +641,8 @@ int main(int argc, char **argv) {
     const char *tokenizer_path = nullptr;
     const char *config_path = nullptr;
     uint32_t max_new_tokens = 0u;
+    lm_sampling_config sampling{};
+    lm_sampling_config_init(&sampling);
     std::vector<char *> filtered;
     filtered.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
@@ -644,6 +660,38 @@ int main(int argc, char **argv) {
                 std::fprintf(stderr, "configuration error: invalid --max-new-tokens\\n");
                 return 2;
             }
+        } else if (std::strcmp(argv[i], "--sampling") == 0 && i + 1 < argc) {
+            const char *value = argv[++i];
+            if (std::strcmp(value, "greedy") == 0) sampling.mode = LM_SAMPLING_GREEDY;
+            else if (std::strcmp(value, "top-k") == 0) sampling.mode = LM_SAMPLING_TOP_K;
+            else if (std::strcmp(value, "top-p") == 0) sampling.mode = LM_SAMPLING_TOP_P;
+            else if (std::strcmp(value, "typical") == 0) sampling.mode = LM_SAMPLING_TYPICAL;
+            else { std::fprintf(stderr, "configuration error: invalid --sampling\\n"); return 2; }
+        } else if (std::strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
+            if (!parse_bounded_u32(argv[++i], &sampling.top_k)) {
+                std::fprintf(stderr, "configuration error: invalid --top-k\\n"); return 2;
+            }
+        } else if ((std::strcmp(argv[i], "--top-p") == 0 || std::strcmp(argv[i], "--min-p") == 0 ||
+                    std::strcmp(argv[i], "--typical-p") == 0 || std::strcmp(argv[i], "--temperature") == 0 ||
+                    std::strcmp(argv[i], "--repetition-penalty") == 0 || std::strcmp(argv[i], "--frequency-penalty") == 0 ||
+                    std::strcmp(argv[i], "--presence-penalty") == 0) && i + 1 < argc) {
+            const char *option = argv[i];
+            float value = 0.0f;
+            if (!parse_finite_float(argv[++i], &value)) {
+                std::fprintf(stderr, "configuration error: invalid decoding float\\n"); return 2;
+            }
+            if (std::strcmp(option, "--top-p") == 0) sampling.top_p = value;
+            else if (std::strcmp(option, "--min-p") == 0) sampling.min_p = value;
+            else if (std::strcmp(option, "--typical-p") == 0) sampling.typical_p = value;
+            else if (std::strcmp(option, "--temperature") == 0) sampling.temperature = value;
+            else if (std::strcmp(option, "--repetition-penalty") == 0) sampling.repetition_penalty = value;
+            else if (std::strcmp(option, "--frequency-penalty") == 0) sampling.frequency_penalty = value;
+            else sampling.presence_penalty = value;
+        } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            char *end = nullptr;
+            const unsigned long long value = std::strtoull(argv[++i], &end, 10);
+            if (!end || *end != '\0') { std::fprintf(stderr, "configuration error: invalid --seed\\n"); return 2; }
+            sampling.seed = static_cast<uint64_t>(value);
         } else filtered.push_back(argv[i]);
     }
     if (generate && max_new_tokens == 0u) {
@@ -661,7 +709,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "configuration error: --server requires --model\\n");
         return 2;
     }
-    const generation_assets assets{tokenizer_path, config_path};
+    const generation_assets assets{tokenizer_path, config_path, sampling};
     bool list_devices = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0) {

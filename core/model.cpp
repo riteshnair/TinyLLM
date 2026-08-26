@@ -19,6 +19,7 @@ struct lm_model_file {
     lm_model_info info;
     lm_model_architecture architecture;
     uint8_t has_architecture;
+    uint8_t hf_tied_output;
     std::vector<lm_model_tensor_info> tensors;
     std::vector<std::string> tokens;
     std::vector<uint64_t> shard_headers;
@@ -845,7 +846,7 @@ lm_status lm_model_open(const char *path, lm_model_file **out_model, char *error
     if (opened != LM_OK) return opened;
     try {
         lm_model_file *model = new lm_model_file{file, nullptr, info, architecture,
-                                                   static_cast<uint8_t>(architecture.block_count != 0u),
+                                                   static_cast<uint8_t>(architecture.block_count != 0u), 0u,
                                                    std::move(tensors), std::move(tokens),
                                                    std::vector<uint64_t>{info.header_bytes},
                                                    std::vector<uint64_t>{info.file_bytes}};
@@ -907,7 +908,7 @@ static lm_status open_safetensors_sharded(const char *const *paths, size_t path_
     combined.tensor_count = tensors.size();
     try {
         *out_model = new lm_model_file{nullptr, shards, combined, architecture,
-                                       static_cast<uint8_t>(architecture.block_count != 0u),
+                                       static_cast<uint8_t>(architecture.block_count != 0u), 0u,
                                        std::move(tensors), std::move(tokens),
                                        std::move(headers), std::move(sizes)};
         return LM_OK;
@@ -997,7 +998,7 @@ lm_status lm_model_open_sharded(const char *const *paths, size_t path_count,
     combined.tensor_count = tensors.size();
     try {
         lm_model_file *model = new lm_model_file{nullptr, shards, combined, architecture,
-                                                   static_cast<uint8_t>(architecture.block_count != 0u),
+                                                   static_cast<uint8_t>(architecture.block_count != 0u), 0u,
                                                    std::move(tensors), std::move(tokens),
                                                    std::move(headers), std::move(sizes)};
         *out_model = model;
@@ -1117,7 +1118,6 @@ lm_status lm_model_set_hf_config_json(lm_model_file *model, const char *path,
         if (have_kv && (kv_heads == 0u || kv_heads > heads)) { set_error(error_text, error_capacity, "invalid Llama attention head configuration"); return LM_ERR_PARSE; }
         set_error(error_text, error_capacity, "config.json lacks required Llama fields"); return LM_ERR_UNSUPPORTED;
     }
-    if (tie_word_embeddings) { set_error(error_text, error_capacity, "tied standard-HF SafeTensors output is unsupported"); return LM_ERR_UNSUPPORTED; }
     if (model->tokenizer) {
         lm_tokenizer_info tokenizer_info{};
         if (lm_tokenizer_get_info(model->tokenizer, &tokenizer_info) != LM_OK || tokenizer_info.vocabulary_size != vocab) {
@@ -1125,6 +1125,7 @@ lm_status lm_model_set_hf_config_json(lm_model_file *model, const char *path,
         }
     }
     model->architecture = {context, hidden, layers, heads, kv_heads, intermediate, rope, rms};
+    model->hf_tied_output = tie_word_embeddings ? 1u : 0u;
     model->has_architecture = 1u;
     return LM_OK;
 }
@@ -1216,7 +1217,10 @@ lm_status lm_model_token_decode(const lm_model_file *model, const uint32_t *toke
         total += model->tokens[tokens[i]].size();
     }
     *out_bytes = total;
-    if (token_count == 0u) return LM_OK;
+    if (token_count == 0u) {
+        if (out_text && out_capacity != 0u) out_text[0] = '\0';
+        return LM_OK;
+    }
     if (!out_text && out_capacity == 0u) return LM_OK;
     if (!out_text || out_capacity <= total) return LM_ERR_CAPACITY;
     size_t position = 0u;
@@ -1793,7 +1797,7 @@ lm_status lm_model_build_llama_graph(const lm_model_file *model,
     const uint32_t layer_required = 0xff8u;
     if ((global_mask & (1u << LM_DECODER_TENSOR_OUTPUT)) == 0u &&
         (global_mask & (1u << LM_DECODER_TENSOR_TOKEN_EMBEDDING)) != 0u &&
-        model->info.format == LM_MODEL_GGUF) {
+        (model->info.format == LM_MODEL_GGUF || model->hf_tied_output != 0u)) {
         out_binding->output = out_binding->token_embedding;
         out_binding->output_tied = 1u;
         global_mask |= 1u << LM_DECODER_TENSOR_OUTPUT;

@@ -4,7 +4,7 @@
 
 The direction makes sense **if the project is defined as a small, stable inference core with replaceable execution modules**, not as a miniature copy of vLLM, SGLang, TensorRT-LLM, and llama.cpp all at once. The proposed engine can be valuable because its differentiator would be a very small C99/C++ core, native GGUF and SafeTensors loading, a replaceable KV-cache subsystem, CPU fallback, Vulkan-first acceleration, explicit hardware discovery, and clean extension points for future decoding and backends.
 
-The strict source constraint is the most important architectural decision. A human-maintained core below approximately **2 MB of C99/C++ source** is feasible only if the core excludes the HTTP server, WebUI, shader compiler, model conversion tools, distributed orchestration, and vendor SDKs. Those features must be optional modules or external processes. A runtime control-plane footprint around **20 MB** is plausible, but it cannot include model weights or a full 4,096-token KV cache for ordinary transformer models. The weights and cache must live in mapped files, VRAM, host memory pools, or explicitly managed overflow storage.
+The strict source constraint is the most important architectural decision. A human-maintained core below approximately **30 MiB of C99/C++ source across the core and backend libraries** is feasible only if the core excludes the HTTP server, WebUI, shader compiler, model conversion tools, distributed orchestration, and vendor SDKs. Those features must be optional modules or external processes. A runtime control-plane footprint around **20 MB** is plausible, but it cannot include model weights or a full 4,096-token KV cache for ordinary transformer models. The weights and cache must live in mapped files, VRAM, host memory pools, or explicitly managed overflow storage.
 
 The central recommendation is therefore:
 
@@ -32,7 +32,7 @@ The budget must be stated precisely or it will become impossible to enforce.
 
 | Budget | Recommended interpretation | Feasible target |
 |---|---|---:|
-| Core source | `core/` C99/C++ only; no WebUI, HTTP, vendor SDK, shader compiler, or conversion tools | 1.2–2.0 MB |
+| Core and backend source | `core/`, backend libraries, and validated execution modules; WebUI, conversion tools, and vendor SDKs remain optional | ≤30 MiB measured source |
 | Core binary | Optional target; measure stripped size per platform and backend | 0.5–3 MB, depending on Vulkan loader use |
 | Control-plane RAM | Allocators, scheduler, metadata, token buffers, page tables, sockets, and small scratch buffers | Approximately 20 MB |
 | Model weights | Memory-mapped or device-resident artifact; excluded from control-plane budget | Model-dependent |
@@ -91,7 +91,7 @@ The CPU backend is mandatory and is also the executable reference implementation
 
 ### Layer C: optional modules
 
-The following should not count against the 2 MB core source target:
+The following should remain separately measurable from the 30 MiB core-plus-backend source allowance:
 
 | Optional module | Reason to keep it outside the core |
 |---|---|
@@ -221,7 +221,7 @@ The runtime should generate a stable capability hash and use it to select cached
 1. **Build-time generation:** produce a compact family of SPIR-V variants and metadata.
 2. **Runtime specialization:** select workgroup size, tile size, vector width, page size, and algorithm based on discovered features and a small bounded autotune cache.
 
-Generating arbitrary shaders at runtime is powerful but can break the 2 MB and startup budgets. The small runtime should select and parameterize trusted variants. A separate `shader_gen` tool can compile larger templates and write signed or checksummed assets.
+Generating arbitrary shaders at runtime is powerful but can break the 30 MiB and startup budgets. The small runtime should select and parameterize trusted variants. A separate `shader_gen` tool can compile larger templates and write signed or checksummed assets.
 
 ## CPU fallback
 
@@ -312,7 +312,7 @@ Multi-machine inference is possible, but “many heads and many tails” is not 
 | Interactive single-user decode | One host/device with local CPU fallback | Cross-laptop synchronization usually hurts TPOT |
 | Large cluster | External scheduler plus prefill/decode pools | Keeps orchestration outside the inference core |
 
-The core should expose a stateless request-phase protocol and KV export/import handles, but the cluster agent should handle discovery, authentication, retries, backpressure, transport compression, and placement. Use TCP/QUIC or a user-provided transport module; do not force a network stack into the 2 MB core.
+The core should expose a stateless request-phase protocol and KV export/import handles, but the cluster agent should handle discovery, authentication, retries, backpressure, transport compression, and placement. Use TCP/QUIC or a user-provided transport module; do not force a network stack into the 30 MiB core-plus-backend source budget.
 
 ## VRAM overflow, PCIe, BAR, and ReBAR
 

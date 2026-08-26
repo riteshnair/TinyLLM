@@ -12,7 +12,7 @@ The project should be built through a sequence of **vertical slices**. Every sli
 
 | Rule | Enforcement |
 |---|---|
-| Core source target | Keep mandatory C99/C++ source under approximately 2 MB; CI reports bytes by module |
+| Core source target | Keep core-plus-backend C99/C++ source under approximately 30 MiB; CI reports bytes by module |
 | Runtime control plane | Keep metadata, scheduler, tokenizer buffers, page tables, and scratch state under 40 MB by default |
 | Model memory | Weights and KV cache are explicitly excluded from the control-plane budget and are separately accounted for |
 | Backend order | CPU reference first, Vulkan first accelerator, ROCr/ROCm/CUDA/OpenVINO/DirectML optional |

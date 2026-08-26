@@ -38,9 +38,9 @@ After completing a specialist operation, retain only the result, decisions, unre
 
 The target engine is a small, modifiable inference runtime with a mandatory scalar CPU path, a first-class Vulkan backend, and optional ROCr/ROCm, CUDA, OpenVINO, and DirectML adapters. It supports GGUF and SafeTensors, paged KV storage, context rolling/compression, disk-backed lazy loading, CLI configuration, local chat, OpenAI/Llama-compatible serving, and future speculative, multi-token, diffusion, or TurboQuant-like plugins.
 
-The mandatory core is constrained to approximately **2 MB of human-maintained C99/C++ source**. The runtime control plane may use up to **40 MB** for metadata, allocators, scheduler state, token buffers, page tables, staging rings, and small scratch arenas. Model weights, mapped files, device memory, host cache, pinned cache, and KV storage are separate measured budgets.
+The human-maintained core plus backend libraries are constrained to approximately **30 MiB of C99/C++ source**. The runtime control plane may use up to **40 MB** for metadata, allocators, scheduler state, token buffers, page tables, staging rings, and small scratch arenas. Model weights, mapped files, device memory, host cache, pinned cache, and KV storage are separate measured budgets.
 
-Keep the following outside the core target: HTTP/WebUI, JSON/TLS, model conversion, shader generation, vendor SDKs, cluster orchestration, profilers, fuzzers, and experimental algorithm implementations. They may call the stable core ABI but must not spread platform conditionals through the core.
+Keep the following outside the core-plus-backend source target unless a module contract and measured budget explicitly include them: HTTP/WebUI, JSON/TLS, model conversion, shader generation, vendor SDKs, cluster orchestration, profilers, fuzzers, and experimental algorithm implementations. They may call the stable core ABI but must not spread platform conditionals through the core.
 
 ## 4. Implementation workflow
 

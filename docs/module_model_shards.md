@@ -6,7 +6,7 @@ OWNS: One read-only lm_file per shard and the model’s shard ownership table; c
 THREADING: Read operations are not concurrent-safe through one stream-backed handle; independent model handles may be used by callers.
 ERRORS: Reject missing, duplicated, misnumbered, incomplete, inconsistent, overlapping, or out-of-range shard tensors; reject ambiguous legacy span lookup on a sharded model and never fall back to the first file. Return LM_ERR_PARSE, LM_ERR_RANGE, LM_ERR_IO, or LM_ERR_UNSUPPORTED.
 BACKENDS: CPU and Vulkan consume the same lazy shard spans; no vendor-specific code.
-BUDGET: No model-wide payload copy; bounded metadata and file descriptors; source remains under 2 MiB.
+BUDGET: No model-wide payload copy; bounded metadata and file descriptors; source remains within the repository-wide 30 MiB core-plus-backend allowance.
 TESTS: Two-shard GGUF fixture with tensors on both shards, malformed split metadata, missing/reversed shard, duplicate tensor, and native CPU/Vulkan differential; two-file SafeTensors F32 fixture with nonzero-shard matvec and duplicate-name rejection.
 CLI: --model continues to name split zero; sibling names are derived from -00001-of-00002.gguf or supplied through the library API.
 DONE: A tensor on a nonzero shard binds and reads exact native bytes, all format-specific shard metadata is checked, ambiguous lookup fails explicitly, and clean dual-backend plus sanitizer tests pass.

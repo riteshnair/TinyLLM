@@ -864,7 +864,10 @@ static void test_safetensors_native_mlp() {
     lm_native_generation_config generation{};
     generation.step = transformer.step;
     generation.step.token_offset = 0u;
-    generation.sampling = {LM_SAMPLING_GREEDY, 0u, 1.0f, 1u};
+    generation.sampling = {};
+    generation.sampling.mode = LM_SAMPLING_GREEDY;
+    generation.sampling.temperature = 1.0f;
+    generation.sampling.seed = 1u;
     generation.max_new_tokens = 1u;
     generation.has_architecture = 1u;
     generation.architecture = transformer.architecture;
@@ -1185,7 +1188,10 @@ static void test_native_mlp_profile() {
     generation.step.rope_theta = 0.0f;
     generation.step.rms_epsilon = config.rms_epsilon;
     generation.step.matrix_format = config.matrix_format;
-    generation.sampling = {LM_SAMPLING_GREEDY, 0u, 1.0f, 17u};
+    generation.sampling = {};
+    generation.sampling.mode = LM_SAMPLING_GREEDY;
+    generation.sampling.temperature = 1.0f;
+    generation.sampling.seed = 17u;
     generation.max_new_tokens = 3u;
     generation.has_stop_token = 0u;
     const uint32_t prompt[] = {0u, 0u};
@@ -1220,6 +1226,14 @@ static void test_native_mlp_profile() {
                                          sizeof(scratch), generated_text, sizeof(generated_text),
                                          &generated_bytes) == LM_OK);
     assert(generated_bytes == 3u && std::strcmp(generated_text, "aaa") == 0);
+    generation.stop_strings[0] = "aa";
+    generation.stop_string_count = 1u;
+    assert(lm_model_generate_native_text(model, &graph, &generation, "ab", 2u, scratch,
+                                         sizeof(scratch), generated_text, sizeof(generated_text),
+                                         &generated_bytes) == LM_OK);
+    assert(generated_bytes == 0u && generated_text[0] == '\0');
+    generation.stop_strings[0] = nullptr;
+    generation.stop_string_count = 0u;
     assert(lm_model_generate_native_text(model, &graph, &generation, "ab", 2u, scratch,
                                          sizeof(scratch), generated_text, 3u,
                                          &generated_bytes) == LM_ERR_CAPACITY);
@@ -1612,14 +1626,34 @@ static void test_tokenizer() {
     std::remove(path);
 }
 
+struct MaskProcessorState {
+    uint32_t token;
+    lm_status status;
+};
+
+static lm_status mask_processor(void *user, float *values, uint32_t vocab_size,
+                                const uint32_t *, size_t) {
+    const MaskProcessorState *state = static_cast<const MaskProcessorState *>(user);
+    if (!state || state->token >= vocab_size) return LM_ERR_ARGUMENT;
+    for (uint32_t i = 0u; i < vocab_size; ++i) values[i] = i == state->token ? values[i] : -INFINITY;
+    return state->status;
+}
+
 static void test_sampling() {
     const float logits[] = {1.0f, 3.0f, 3.0f, -2.0f};
-    lm_sampling_config greedy{LM_SAMPLING_GREEDY, 0u, 1.0f, 1u};
+    lm_sampling_config greedy{};
+    greedy.mode = LM_SAMPLING_GREEDY;
+    greedy.temperature = 1.0f;
+    greedy.seed = 1u;
     uint32_t token = 99u;
     float probability = 0.0f;
     assert(lm_sample_logits(logits, 4u, &greedy, &token, &probability) == LM_OK);
     assert(token == 1u && probability == 1.0f);
-    lm_sampling_config top_k{LM_SAMPLING_TOP_K, 2u, 1.0f, 123u};
+    lm_sampling_config top_k{};
+    top_k.mode = LM_SAMPLING_TOP_K;
+    top_k.top_k = 2u;
+    top_k.temperature = 1.0f;
+    top_k.seed = 123u;
     uint32_t first_token = 99u;
     float first_probability = 0.0f;
     assert(lm_sample_logits(logits, 4u, &top_k, &first_token, &first_probability) == LM_OK);
@@ -1628,8 +1662,69 @@ static void test_sampling() {
     float second_probability = 0.0f;
     assert(lm_sample_logits(logits, 4u, &top_k, &second_token, &second_probability) == LM_OK);
     assert(first_token == second_token && first_probability == second_probability);
-    lm_sampling_config invalid{LM_SAMPLING_TOP_K, 5u, 1.0f, 1u};
+    lm_sampling_config invalid = top_k;
+    invalid.top_k = 5u;
     assert(lm_sample_logits(logits, 4u, &invalid, &token, &probability) == LM_ERR_ARGUMENT);
+    lm_sampling_config nucleus = greedy;
+    nucleus.mode = LM_SAMPLING_TOP_P;
+    nucleus.top_p = 0.6f;
+    nucleus.seed = 4u;
+    assert(lm_sample_logits(logits, 4u, &nucleus, &token, &probability) == LM_OK);
+    assert((token == 1u || token == 2u) && probability > 0.0f);
+    lm_sampling_config min_probability = greedy;
+    min_probability.min_p = 0.8f;
+    assert(lm_sample_logits(logits, 4u, &min_probability, &token, &probability) == LM_OK);
+    assert(token == 1u);
+    const uint32_t history[] = {1u, 1u};
+    lm_sampling_config penalized = greedy;
+    penalized.repetition_penalty = 2.0f;
+    penalized.frequency_penalty = 1.0f;
+    penalized.presence_penalty = 0.5f;
+    penalized.history_tokens = history;
+    penalized.history_count = 2u;
+    assert(lm_sample_logits(logits, 4u, &penalized, &token, &probability) == LM_OK);
+    assert(token == 2u);
+    lm_sampling_config typical = greedy;
+    typical.mode = LM_SAMPLING_TYPICAL;
+    typical.typical_p = 0.9f;
+    assert(lm_sample_logits(logits, 4u, &typical, &token, &probability) == LM_OK);
+    const float original_logits[] = {1.0f, 3.0f, 3.0f, -2.0f};
+    MaskProcessorState mask{3u, LM_OK};
+    lm_sampling_config constrained = greedy;
+    constrained.processor = mask_processor;
+    constrained.processor_user = &mask;
+    assert(lm_sample_logits(logits, 4u, &constrained, &token, &probability) == LM_OK && token == 3u);
+    assert(std::memcmp(logits, original_logits, sizeof(logits)) == 0);
+    mask.status = LM_ERR_UNSUPPORTED;
+    assert(lm_sample_logits(logits, 4u, &constrained, &token, &probability) == LM_ERR_UNSUPPORTED);
+    const uint32_t speculative_history[] = {1u, 2u, 3u, 4u, 5u, 1u, 2u, 3u};
+    lm_ngram_speculative_config ngram{2u, 3u, 2u};
+    uint32_t draft[2] = {};
+    size_t draft_count = 0u;
+    assert(lm_speculative_ngram_propose(speculative_history, 8u, &ngram, draft, 2u, &draft_count) == LM_OK);
+    assert(draft_count == 2u && draft[0] == 4u && draft[1] == 5u);
+    float target_logits[3u * 8u] = {};
+    target_logits[4u] = 10.0f;
+    target_logits[8u + 5u] = 10.0f;
+    target_logits[16u + 6u] = 10.0f;
+    uint32_t verified[3] = {};
+    lm_speculative_stats stats{};
+    size_t verified_count = 0u;
+    assert(lm_speculative_verify_greedy(draft, 2u, target_logits, 8u, 8u, verified, 3u,
+                                        &verified_count, &stats) == LM_OK);
+    assert(verified_count == 3u && verified[0] == 4u && verified[1] == 5u && verified[2] == 6u &&
+           stats.accepted_tokens == 2u && stats.rejected_tokens == 0u);
+    target_logits[8u + 7u] = 11.0f;
+    assert(lm_speculative_verify_greedy(draft, 2u, target_logits, 8u, 8u, verified, 3u,
+                                        &verified_count, &stats) == LM_OK);
+    assert(verified_count == 2u && verified[0] == 4u && verified[1] == 7u &&
+           stats.accepted_tokens == 1u && stats.rejected_tokens == 1u);
+    uint32_t depth = 0u;
+    assert(lm_speculative_adaptive_depth(&stats, 4u, 1u, 8u, &depth) == LM_OK && depth == 4u);
+    lm_speculative_stats high{8u, 7u, 1u, 1u};
+    assert(lm_speculative_adaptive_depth(&high, 4u, 1u, 8u, &depth) == LM_OK && depth == 5u);
+    lm_speculative_stats low{8u, 1u, 7u, 1u};
+    assert(lm_speculative_adaptive_depth(&low, 4u, 1u, 8u, &depth) == LM_OK && depth == 3u);
     assert(lm_sample_logits(nullptr, 4u, &greedy, &token, &probability) == LM_ERR_ARGUMENT);
 }
 
@@ -1807,6 +1902,67 @@ static void test_moe_router() {
     for (float value : native_output) assert(value == 16777216.0f);
 }
 
+
+static void test_prefix_cache() {
+    lm_prefix_cache *cache = nullptr;
+    assert(lm_prefix_cache_create(2u, 8u, &cache) == LM_OK);
+    const uint32_t short_prefix[] = {1u, 2u};
+    const uint32_t long_prefix[] = {1u, 2u, 3u};
+    const uint32_t query[] = {1u, 2u, 3u, 4u};
+    assert(lm_prefix_cache_insert(cache, 11u, 22u, short_prefix, 2u, 7u) == LM_OK);
+    assert(lm_prefix_cache_insert(cache, 11u, 22u, long_prefix, 3u, 9u) == LM_OK);
+    uint32_t page = UINT32_MAX;
+    size_t prefix_tokens = 0u;
+    assert(lm_prefix_cache_lookup(cache, 11u, 22u, query, 4u, &page, &prefix_tokens) == LM_OK);
+    assert(page == 9u && prefix_tokens == 3u);
+    assert(lm_prefix_cache_lookup(cache, 99u, 22u, query, 4u, &page, &prefix_tokens) == LM_ERR_RANGE);
+    const uint32_t other[] = {5u};
+    assert(lm_prefix_cache_insert(cache, 11u, 22u, other, 1u, 12u) == LM_OK);
+    assert(lm_prefix_cache_lookup(cache, 11u, 22u, short_prefix, 2u, &page, &prefix_tokens) == LM_ERR_RANGE);
+    lm_prefix_cache_stats stats{};
+    assert(lm_prefix_cache_get_stats(cache, &stats) == LM_OK);
+    assert(stats.entries == 2u && stats.hits == 1u && stats.misses == 2u && stats.evictions == 1u);
+    assert(lm_prefix_cache_erase_page(cache, 9u) == LM_OK);
+    assert(lm_prefix_cache_get_stats(cache, &stats) == LM_OK && stats.entries == 1u);
+    lm_prefix_cache_destroy(cache);
+}
+
+struct BatchCallbackState {
+    uint32_t order[8];
+    uint32_t count;
+    uint32_t calls[8];
+};
+
+static lm_status batch_callback(void *user, uint32_t request_id, uint32_t *out_token, uint8_t *out_finished) {
+    BatchCallbackState *state = static_cast<BatchCallbackState *>(user);
+    if (!state || request_id >= 8u || !out_token || !out_finished) return LM_ERR_ARGUMENT;
+    state->order[state->count++] = request_id;
+    ++state->calls[request_id];
+    *out_token = request_id * 10u + state->calls[request_id];
+    *out_finished = state->calls[request_id] >= 2u ? 1u : 0u;
+    return LM_OK;
+}
+
+static void test_batch_scheduler() {
+    lm_batch_scheduler *scheduler = nullptr;
+    assert(lm_batch_scheduler_create(3u, &scheduler) == LM_OK);
+    assert(lm_batch_scheduler_submit(scheduler, 1u) == LM_OK);
+    assert(lm_batch_scheduler_submit(scheduler, 2u) == LM_OK);
+    assert(lm_batch_scheduler_submit(scheduler, 3u) == LM_OK);
+    assert(lm_batch_scheduler_submit(scheduler, 1u) == LM_ERR_STATE);
+    BatchCallbackState state{};
+    uint32_t stepped = 0u;
+    assert(lm_batch_scheduler_step(scheduler, batch_callback, &state, &stepped) == LM_OK && stepped == 3u);
+    assert(state.order[0] == 1u && state.order[1] == 2u && state.order[2] == 3u);
+    assert(lm_batch_scheduler_cancel(scheduler, 2u) == LM_OK);
+    assert(lm_batch_scheduler_cancel(scheduler, 2u) == LM_ERR_RANGE);
+    assert(lm_batch_scheduler_step(scheduler, batch_callback, &state, &stepped) == LM_OK && stepped == 2u);
+    lm_batch_scheduler_stats stats{};
+    assert(lm_batch_scheduler_get_stats(scheduler, &stats) == LM_OK);
+    assert(stats.active == 0u && stats.capacity == 3u && stats.submitted == 3u &&
+           stats.completed == 2u && stats.cancelled == 1u && stats.steps == 5u);
+    lm_batch_scheduler_destroy(scheduler);
+}
 
 static void test_kv_pages() {
     lm_kv_cache *cache = nullptr;
@@ -2100,6 +2256,8 @@ int main() {
     test_sampling();
     test_cpu_decoder();
     test_moe_router();
+    test_prefix_cache();
+    test_batch_scheduler();
     test_kv_pages();
     test_kv_payload();
     test_kv_typed_codecs();

@@ -845,6 +845,40 @@ lm_status lm_model_execute_native_transformer(const lm_model_file *model,
     return finite_array(out_logits, config->step.vocab_size) ? LM_OK : LM_ERR_RANGE;
 }
 
+static lm_status trim_stop_string(const lm_model_file *model,
+                                  const lm_native_generation_config *config,
+                                  const std::vector<uint32_t> &tokens,
+                                  size_t *count,
+                                  std::vector<char> *decoded) {
+    if (!model || !config || !count || !decoded || config->stop_string_count == 0u) return LM_OK;
+    if (*count == 0u) return LM_OK;
+    size_t bytes_capacity = tokens.size() > (std::numeric_limits<size_t>::max() - 1u) / 1024u
+        ? 0u : tokens.size() * 1024u + 1u;
+    if (bytes_capacity == 0u) return LM_ERR_CAPACITY;
+    try { decoded->resize(bytes_capacity); } catch (const std::bad_alloc &) { return LM_ERR_CAPACITY; }
+    const auto decode_prefix = [&](size_t prefix, size_t *bytes) {
+        return lm_model_token_decode(model, tokens.data(), prefix, decoded->data(), decoded->size(), bytes);
+    };
+    size_t decoded_bytes = 0u;
+    const lm_status full_status = decode_prefix(*count, &decoded_bytes);
+    if (full_status != LM_OK) return full_status;
+    for (uint32_t i = 0u; i < config->stop_string_count; ++i) {
+        const char *stop = config->stop_strings[i];
+        const size_t stop_bytes = std::strlen(stop);
+        if (stop_bytes == 0u || decoded_bytes < stop_bytes ||
+            std::memcmp(decoded->data() + decoded_bytes - stop_bytes, stop, stop_bytes) != 0) continue;
+        const size_t wanted = decoded_bytes - stop_bytes;
+        for (size_t keep = *count;; --keep) {
+            size_t prefix_bytes = 0u;
+            const lm_status prefix_status = decode_prefix(keep, &prefix_bytes);
+            if (prefix_status != LM_OK) return prefix_status;
+            if (prefix_bytes == wanted) { *count = keep; return LM_OK; }
+            if (keep == 0u || prefix_bytes < wanted) break;
+        }
+    }
+    return LM_OK;
+}
+
 static lm_status lm_model_generate_native_impl(const lm_model_file *model,
                                                 const lm_decoder_graph_binding *graph,
                                                 const lm_native_generation_config *config,
@@ -871,8 +905,12 @@ static lm_status lm_model_generate_native_impl(const lm_model_file *model,
         config->step.vocab_size > kNativeProfileMaxVocab ||
         config->step.intermediate_size == 0u ||
         config->step.intermediate_size > kNativeProfileMaxIntermediate ||
+        config->stop_string_count > 4u ||
         (config->has_stop_token && (config->stop_token >= config->step.vocab_size)))
         return LM_ERR_ARGUMENT;
+    for (uint32_t i = 0u; i < config->stop_string_count; ++i)
+        if (!config->stop_strings[i] || config->stop_strings[i][0] == '\0') return LM_ERR_ARGUMENT;
+    if (callback && config->stop_string_count != 0u) return LM_ERR_UNSUPPORTED;
     for (size_t i = 0u; i < prompt_count; ++i)
         if (prompt_tokens[i] >= config->step.vocab_size) return LM_ERR_RANGE;
     if (config->context_policy != LM_CONTEXT_REJECT_OVERFLOW && config->context_policy != LM_CONTEXT_ROLLING_TAIL)
@@ -904,6 +942,7 @@ static lm_status lm_model_generate_native_impl(const lm_model_file *model,
     std::vector<lm_kv_cache *> layer_caches;
     std::vector<uint8_t> page_live;
     std::vector<float> logits;
+    std::vector<char> decoded_stop;
     try {
         layer_caches.assign(graph->layer_count, nullptr);
         page_live.assign(graph->layer_count, 0u);
@@ -959,11 +998,15 @@ static lm_status lm_model_generate_native_impl(const lm_model_file *model,
             if (status != LM_OK) break;
             out_tokens[*out_count] = next_token;
             ++*out_count;
+            const size_t before_stop = *out_count;
+            status = trim_stop_string(model, config, std::vector<uint32_t>(out_tokens, out_tokens + *out_count),
+                                      out_count, &decoded_stop);
+            if (status != LM_OK) break;
             if (callback) {
                 status = callback(user, next_token, probability);
                 if (status != LM_OK) break;
             }
-            if (config->has_stop_token && next_token == config->stop_token) break;
+            if (*out_count != before_stop || (config->has_stop_token && next_token == config->stop_token)) break;
             if (i + 1u == config->max_new_tokens) break;
             for (uint32_t layer = 0u; layer < graph->layer_count; ++layer) {
                 uint32_t page_id = page_live[layer] == 0u ? UINT32_MAX : 0u;
