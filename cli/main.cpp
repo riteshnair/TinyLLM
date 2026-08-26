@@ -4,6 +4,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <string>
+#include <algorithm>
+#include <cctype>
+#if defined(__unix__) || defined(__APPLE__)
+#include <arpa/inet.h>
+#include <cerrno>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 static void print_help() {
     std::puts("tiny-lm control-plane slice");
@@ -14,6 +24,7 @@ static void print_help() {
     std::puts("  --kv-page-tokens N --trace --deterministic --no-prefetch");
     std::puts("  --dump-config --dry-run --list-devices --help");
     std::puts("  --generate --prompt TEXT --max-new-tokens N");
+    std::puts("  --server --port N --model PATH");
 }
 
 static void text_probe(void *, const lm_probe *probe) {
@@ -32,8 +43,10 @@ static bool parse_bounded_u32(const char *text, uint32_t *out) {
 }
 
 static lm_status run_native_generation(const lm_config &config, const char *prompt,
-                                       uint32_t max_new_tokens) {
-    if (!config.model_path[0] || !prompt || max_new_tokens == 0u) return LM_ERR_ARGUMENT;
+                                       uint32_t max_new_tokens, char *result,
+                                       size_t result_capacity, size_t *result_bytes) {
+    if (!config.model_path[0] || !prompt || max_new_tokens == 0u ||
+        (result == nullptr) != (result_bytes == nullptr)) return LM_ERR_ARGUMENT;
     lm_model_file *model = nullptr;
     char error[128] = {};
     lm_status status = lm_model_open(config.model_path, &model, error, sizeof(error));
@@ -170,25 +183,205 @@ static lm_status run_native_generation(const lm_config &config, const char *prom
                                            scratch.data(), scratch.size(), generated.data(), generated.size(),
                                            &generated_bytes);
     if (status == LM_OK) {
-        std::printf("generated=");
-        std::fwrite(generated.data(), 1u, generated_bytes, stdout);
-        std::puts("");
+        if (result) {
+            if (generated_bytes > result_capacity) status = LM_ERR_CAPACITY;
+            else {
+                std::memcpy(result, generated.data(), generated_bytes);
+                *result_bytes = generated_bytes;
+            }
+        } else {
+            std::printf("generated=");
+            std::fwrite(generated.data(), 1u, generated_bytes, stdout);
+            std::puts("");
+        }
     }
     lm_model_close(model);
     return status;
 }
 
+static bool json_string_field(const char *body, const char *key, std::string *out) {
+    if (!body || !key || !out) return false;
+    const std::string needle = std::string("\"") + key + "\"";
+    const char *at = std::strstr(body, needle.c_str());
+    if (!at) return false;
+    at += needle.size();
+    while (*at && std::isspace(static_cast<unsigned char>(*at))) ++at;
+    if (*at++ != ':') return false;
+    while (*at && std::isspace(static_cast<unsigned char>(*at))) ++at;
+    if (*at++ != '\"') return false;
+    out->clear();
+    for (size_t count = 0u; *at && count < (1u << 16u); ++count, ++at) {
+        if (*at == '\"') return true;
+        if (*at == '\\') {
+            ++at;
+            if (!*at) return false;
+            if (*at == 'n') out->push_back('\n');
+            else if (*at == 'r') out->push_back('\r');
+            else if (*at == 't') out->push_back('\t');
+            else if (*at == '\"' || *at == '\\' || *at == '/') out->push_back(*at);
+            else return false;
+        } else {
+            if (static_cast<unsigned char>(*at) < 0x20u) return false;
+            out->push_back(*at);
+        }
+    }
+    return false;
+}
+
+static bool json_u32_field(const char *body, const char *key, uint32_t *out) {
+    if (!body || !key || !out) return false;
+    const std::string needle = std::string("\"") + key + "\"";
+    const char *at = std::strstr(body, needle.c_str());
+    if (!at) return false;
+    at += needle.size();
+    while (*at && std::isspace(static_cast<unsigned char>(*at))) ++at;
+    if (*at++ != ':') return false;
+    while (*at && std::isspace(static_cast<unsigned char>(*at))) ++at;
+    if (*at < '0' || *at > '9') return false;
+    uint64_t value = 0u;
+    while (*at >= '0' && *at <= '9') {
+        value = value * 10u + static_cast<uint64_t>(*at - '0');
+        if (value > 1024u) return false;
+        ++at;
+    }
+    *out = static_cast<uint32_t>(value);
+    return true;
+}
+
+static bool json_bool_field(const char *body, const char *key, bool *out) {
+    if (!body || !key || !out) return false;
+    const std::string needle = std::string("\"") + key + "\"";
+    const char *at = std::strstr(body, needle.c_str());
+    if (!at) return false;
+    at += needle.size();
+    while (*at && std::isspace(static_cast<unsigned char>(*at))) ++at;
+    if (*at++ != ':') return false;
+    while (*at && std::isspace(static_cast<unsigned char>(*at))) ++at;
+    if (std::strncmp(at, "true", 4u) == 0) { *out = true; return true; }
+    if (std::strncmp(at, "false", 5u) == 0) { *out = false; return true; }
+    return false;
+}
+
+static std::string json_escape(const char *text, size_t bytes) {
+    std::string escaped;
+    escaped.reserve(bytes + 16u);
+    for (size_t i = 0u; i < bytes; ++i) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        if (c == '\\' || c == '\"') { escaped.push_back('\\'); escaped.push_back(static_cast<char>(c)); }
+        else if (c == '\n') escaped += "\\n";
+        else if (c == '\r') escaped += "\\r";
+        else if (c == '\t') escaped += "\\t";
+        else if (c >= 0x20u) escaped.push_back(static_cast<char>(c));
+    }
+    return escaped;
+}
+
+#if defined(__unix__) || defined(__APPLE__)
+static bool send_all(int socket_fd, const char *data, size_t bytes) {
+    while (bytes != 0u) {
+        const ssize_t sent = send(socket_fd, data, bytes, 0);
+        if (sent <= 0) return false;
+        data += sent;
+        bytes -= static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+static void send_http(int socket_fd, int status, const char *content_type, const std::string &body) {
+    char header[256] = {};
+    const int length = std::snprintf(header, sizeof(header),
+                                     "HTTP/1.1 %d\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+                                     status, content_type, body.size());
+    if (length > 0) { send_all(socket_fd, header, static_cast<size_t>(length)); send_all(socket_fd, body.data(), body.size()); }
+}
+
+static int run_http_server(const lm_config &config, uint32_t port) {
+    const int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) return 4;
+    int reuse = 1;
+    (void)setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(static_cast<uint16_t>(port));
+    if (bind(server_fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) < 0 || listen(server_fd, 8) < 0) {
+        close(server_fd);
+        return 4;
+    }
+    std::printf("server=127.0.0.1:%u\n", port);
+    for (;;) {
+        const int client = accept(server_fd, nullptr, nullptr);
+        if (client < 0) { if (errno == EINTR) continue; break; }
+        char request[1u << 16u] = {};
+        const ssize_t received = recv(client, request, sizeof(request) - 1u, 0);
+        if (received <= 0) { close(client); continue; }
+        request[received] = '\0';
+        const char *body = std::strstr(request, "\r\n\r\n");
+        if (!body) { send_http(client, 400, "application/json", "{\"error\":\"invalid_http\"}"); close(client); continue; }
+        body += 4;
+        if (std::strncmp(request, "GET /health ", 12u) == 0) {
+            send_http(client, 200, "application/json", "{\"status\":\"ok\"}");
+        } else if (std::strncmp(request, "POST /v1/completions ", 21u) == 0 ||
+                   std::strncmp(request, "POST /v1/chat/completions ", 26u) == 0) {
+            std::string prompt;
+            uint32_t max_tokens = 8u;
+            bool stream = false;
+            if (!json_string_field(body, "prompt", &prompt) ||
+                (std::strstr(body, "\"max_tokens\"") && !json_u32_field(body, "max_tokens", &max_tokens)) ||
+                (std::strstr(body, "\"stream\"") && !json_bool_field(body, "stream", &stream)) ||
+                max_tokens == 0u || max_tokens > 64u) {
+                send_http(client, 400, "application/json", "{\"error\":\"invalid_request\"}");
+            } else {
+                std::vector<char> generated(static_cast<size_t>(max_tokens) * 256u + 1u, '\0');
+                size_t generated_bytes = 0u;
+                const lm_status status = run_native_generation(config, prompt.c_str(), max_tokens,
+                                                               generated.data(), generated.size(), &generated_bytes);
+                if (status != LM_OK) {
+                    const std::string error = std::string("{\"error\":\"") + lm_status_name(status) + "\"}";
+                    send_http(client, status == LM_ERR_UNSUPPORTED ? 501 : 500, "application/json", error);
+                } else if (stream) {
+                    const std::string event = std::string("data: {\"choices\":[{\"text\":\"") +
+                                              json_escape(generated.data(), generated_bytes) +
+                                              "\"}]}\n\ndata: [DONE]\n\n";
+                    const std::string header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+                    send_all(client, header.data(), header.size());
+                    send_all(client, event.data(), event.size());
+                } else {
+                    const std::string response = std::string("{\"choices\":[{\"text\":\"") +
+                                                  json_escape(generated.data(), generated_bytes) + "\",\"finish_reason\":\"stop\"}]}";
+                    send_http(client, 200, "application/json", response);
+                }
+            }
+        } else {
+            send_http(client, 404, "application/json", "{\"error\":\"not_found\"}");
+        }
+        close(client);
+    }
+    close(server_fd);
+    return 0;
+}
+#else
+static int run_http_server(const lm_config &, uint32_t) { return 4; }
+#endif
+
 int main(int argc, char **argv) {
     lm_config config;
     lm_config_init(&config);
     bool generate = false;
+    bool server = false;
+    uint32_t server_port = 8080u;
     const char *prompt = nullptr;
     uint32_t max_new_tokens = 0u;
     std::vector<char *> filtered;
     filtered.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--generate") == 0) generate = true;
-        else if (std::strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) prompt = argv[++i];
+        else if (std::strcmp(argv[i], "--server") == 0) server = true;
+        else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            const unsigned long value = std::strtoul(argv[++i], nullptr, 10);
+            if (value == 0u || value > 65535u) { std::fprintf(stderr, "configuration error: invalid --port\\n"); return 2; }
+            server_port = static_cast<uint32_t>(value);
+        } else if (std::strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) prompt = argv[++i];
         else if (std::strcmp(argv[i], "--max-new-tokens") == 0 && i + 1 < argc) {
             if (!parse_bounded_u32(argv[++i], &max_new_tokens)) {
                 std::fprintf(stderr, "configuration error: invalid --max-new-tokens\\n");
@@ -207,6 +400,10 @@ int main(int argc, char **argv) {
                      lm_status_name(parsed), bad ? bad : "unknown");
         return 2;
     }
+    if (server && !config.model_path[0]) {
+        std::fprintf(stderr, "configuration error: --server requires --model\\n");
+        return 2;
+    }
     bool list_devices = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0) {
@@ -215,8 +412,9 @@ int main(int argc, char **argv) {
         }
         if (std::strcmp(argv[i], "--list-devices") == 0) list_devices = true;
     }
+    if (server) return run_http_server(config, server_port);
     if (generate) {
-        const lm_status status = run_native_generation(config, prompt, max_new_tokens);
+        const lm_status status = run_native_generation(config, prompt, max_new_tokens, nullptr, 0u, nullptr);
         return status == LM_OK ? 0 : 4;
     }
     if (list_devices) {

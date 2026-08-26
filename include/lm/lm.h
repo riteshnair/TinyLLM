@@ -697,6 +697,24 @@ typedef struct lm_native_generation_config {
     lm_model_architecture architecture;
 } lm_native_generation_config;
 
+typedef lm_status (*lm_native_token_callback)(void *user, uint32_t token_id, float probability);
+
+lm_status lm_model_generate_native_stream(const lm_model_file *model,
+                                          const lm_decoder_graph_binding *graph,
+                                          const lm_native_generation_config *config,
+                                          const uint32_t *prompt_tokens, size_t prompt_count,
+                                          void *packed_scratch, uint64_t packed_scratch_bytes,
+                                          lm_native_token_callback callback, void *user);
+lm_status lm_model_generate_native_text_batch(const lm_model_file *model,
+                                              const lm_decoder_graph_binding *graph,
+                                              const lm_native_generation_config *config,
+                                              const char *const *prompts,
+                                              const size_t *prompt_bytes,
+                                              size_t prompt_count,
+                                              void *packed_scratch, uint64_t packed_scratch_bytes,
+                                              char *out_text, size_t output_stride,
+                                              size_t *out_bytes);
+
 lm_status lm_model_generate_native(const lm_model_file *model,
                                    const lm_decoder_graph_binding *graph,
                                    const lm_native_generation_config *config,

@@ -16,6 +16,16 @@ static void capture_probe(void *user, const lm_probe *probe) {
     state->last_stage = probe->stage;
 }
 
+struct TokenCapture { std::vector<uint32_t> tokens; std::vector<float> probabilities; };
+
+static lm_status capture_token(void *user, uint32_t token_id, float probability) {
+    TokenCapture *capture = static_cast<TokenCapture *>(user);
+    if (!capture || !std::isfinite(probability)) return LM_ERR_RANGE;
+    capture->tokens.push_back(token_id);
+    capture->probabilities.push_back(probability);
+    return LM_OK;
+}
+
 static void test_defaults() {
     lm_config config;
     lm_config_init(&config);
@@ -719,8 +729,33 @@ static void test_safetensors_native_mlp() {
     uint32_t generated_tokens[1] = {};
     size_t generated_count = 0u;
     assert(lm_model_generate_native(model, &graph, &generation, prompt_tokens, 1u, scratch, sizeof(scratch),
-                                    generated_tokens, 1u, &generated_count) == LM_OK);
+                                     generated_tokens, 1u, &generated_count) == LM_OK);
     assert(generated_count == 1u && generated_tokens[0] < 2u);
+    TokenCapture capture;
+    assert(lm_model_generate_native_stream(model, &graph, &generation, prompt_tokens, 1u,
+                                           scratch, sizeof(scratch), capture_token, &capture) == LM_OK);
+    assert(capture.tokens.size() == 1u && capture.tokens[0] == generated_tokens[0] &&
+           capture.probabilities.size() == 1u);
+    const char *batch_prompts[] = {"a", "b"};
+    const size_t batch_bytes[] = {1u, 1u};
+    char expected_a[4] = {};
+    char expected_b[4] = {};
+    size_t expected_a_bytes = 0u;
+    size_t expected_b_bytes = 0u;
+    assert(lm_model_generate_native_text(model, &graph, &generation, batch_prompts[0], batch_bytes[0],
+                                         scratch, sizeof(scratch), expected_a, sizeof(expected_a),
+                                         &expected_a_bytes) == LM_OK);
+    assert(lm_model_generate_native_text(model, &graph, &generation, batch_prompts[1], batch_bytes[1],
+                                         scratch, sizeof(scratch), expected_b, sizeof(expected_b),
+                                         &expected_b_bytes) == LM_OK);
+    char batch_output[8] = {};
+    size_t batch_output_bytes[2] = {};
+    assert(lm_model_generate_native_text_batch(model, &graph, &generation, batch_prompts, batch_bytes, 2u,
+                                               scratch, sizeof(scratch), batch_output, 4u,
+                                               batch_output_bytes) == LM_OK);
+    assert(batch_output_bytes[0] == expected_a_bytes && batch_output_bytes[1] == expected_b_bytes &&
+           std::memcmp(batch_output, expected_a, expected_a_bytes) == 0 &&
+           std::memcmp(batch_output + 4u, expected_b, expected_b_bytes) == 0);
     lm_kv_cache_destroy(transformer_cache);
     lm_kv_cache_destroy(step_cache);
     lm_model_close(model);

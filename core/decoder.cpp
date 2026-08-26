@@ -697,16 +697,18 @@ lm_status lm_model_execute_native_transformer(const lm_model_file *model,
     return finite_array(out_logits, config->step.vocab_size) ? LM_OK : LM_ERR_RANGE;
 }
 
-lm_status lm_model_generate_native(const lm_model_file *model,
-                                   const lm_decoder_graph_binding *graph,
-                                   const lm_native_generation_config *config,
-                                   const uint32_t *prompt_tokens,
-                                   size_t prompt_count,
-                                   void *packed_scratch,
-                                   uint64_t packed_scratch_bytes,
-                                   uint32_t *out_tokens,
-                                   size_t token_capacity,
-                                   size_t *out_count) {
+static lm_status lm_model_generate_native_impl(const lm_model_file *model,
+                                                const lm_decoder_graph_binding *graph,
+                                                const lm_native_generation_config *config,
+                                                const uint32_t *prompt_tokens,
+                                                size_t prompt_count,
+                                                void *packed_scratch,
+                                                uint64_t packed_scratch_bytes,
+                                                uint32_t *out_tokens,
+                                                size_t token_capacity,
+                                                size_t *out_count,
+                                                lm_native_token_callback callback,
+                                                void *user) {
     if (!model || !graph || !config || !prompt_tokens || !packed_scratch || !out_tokens || !out_count ||
         prompt_count == 0u || config->max_new_tokens == 0u ||
         prompt_count > static_cast<size_t>(1u << 20u) || config->max_new_tokens > kMaxNativeGeneratedTokens ||
@@ -783,6 +785,10 @@ lm_status lm_model_generate_native(const lm_model_file *model,
             if (status != LM_OK) break;
             out_tokens[*out_count] = next_token;
             ++*out_count;
+            if (callback) {
+                status = callback(user, next_token, probability);
+                if (status != LM_OK) break;
+            }
             if (config->has_stop_token && next_token == config->stop_token) break;
             if (i + 1u == config->max_new_tokens) break;
             for (uint32_t layer = 0u; layer < graph->layer_count; ++layer) {
@@ -802,6 +808,36 @@ lm_status lm_model_generate_native(const lm_model_file *model,
     }
     cleanup();
     return status;
+}
+
+lm_status lm_model_generate_native(const lm_model_file *model,
+                                   const lm_decoder_graph_binding *graph,
+                                   const lm_native_generation_config *config,
+                                   const uint32_t *prompt_tokens,
+                                   size_t prompt_count,
+                                   void *packed_scratch,
+                                   uint64_t packed_scratch_bytes,
+                                   uint32_t *out_tokens,
+                                   size_t token_capacity,
+                                   size_t *out_count) {
+    return lm_model_generate_native_impl(model, graph, config, prompt_tokens, prompt_count,
+                                         packed_scratch, packed_scratch_bytes, out_tokens,
+                                         token_capacity, out_count, nullptr, nullptr);
+}
+
+lm_status lm_model_generate_native_stream(const lm_model_file *model,
+                                          const lm_decoder_graph_binding *graph,
+                                          const lm_native_generation_config *config,
+                                          const uint32_t *prompt_tokens, size_t prompt_count,
+                                          void *packed_scratch, uint64_t packed_scratch_bytes,
+                                          lm_native_token_callback callback, void *user) {
+    if (!callback || !config || config->max_new_tokens == 0u) return LM_ERR_ARGUMENT;
+    std::vector<uint32_t> tokens;
+    try { tokens.resize(config->max_new_tokens); } catch (const std::bad_alloc &) { return LM_ERR_CAPACITY; }
+    size_t count = 0u;
+    return lm_model_generate_native_impl(model, graph, config, prompt_tokens, prompt_count,
+                                         packed_scratch, packed_scratch_bytes, tokens.data(),
+                                         tokens.size(), &count, callback, user);
 }
 
 lm_status lm_model_generate_native_text(const lm_model_file *model,
@@ -838,6 +874,28 @@ lm_status lm_model_generate_native_text(const lm_model_file *model,
     if (status != LM_OK) return status;
     return lm_model_token_decode(model, generated.data(), generated_count, out_text,
                                  out_capacity, out_bytes);
+}
+
+lm_status lm_model_generate_native_text_batch(const lm_model_file *model,
+                                              const lm_decoder_graph_binding *graph,
+                                              const lm_native_generation_config *config,
+                                              const char *const *prompts,
+                                              const size_t *prompt_bytes,
+                                              size_t prompt_count,
+                                              void *packed_scratch, uint64_t packed_scratch_bytes,
+                                              char *out_text, size_t output_stride,
+                                              size_t *out_bytes) {
+    if (!model || !graph || !config || !prompts || !prompt_bytes || !packed_scratch || !out_text ||
+        !out_bytes || prompt_count == 0u || prompt_count > 64u || output_stride == 0u) return LM_ERR_ARGUMENT;
+    for (size_t i = 0u; i < prompt_count; ++i) {
+        if (!prompts[i] || i > (std::numeric_limits<size_t>::max() / output_stride)) return LM_ERR_ARGUMENT;
+        const lm_status status = lm_model_generate_native_text(model, graph, config, prompts[i], prompt_bytes[i],
+                                                               packed_scratch, packed_scratch_bytes,
+                                                               out_text + i * output_stride, output_stride,
+                                                               &out_bytes[i]);
+        if (status != LM_OK) return status;
+    }
+    return LM_OK;
 }
 
 lm_status lm_cpu_decoder_create(const lm_cpu_decoder_config *config, lm_cpu_decoder **out_decoder) {
