@@ -775,6 +775,37 @@ lm_status lm_model_tensor_binding_read(const lm_model_tensor_binding *binding, v
     return lm_model_tensor_binding_view(binding, data, bytes, out_tensor);
 }
 
+lm_status lm_model_tensor_matvec_f32_cpu(const lm_model_file *model, uint64_t tensor_index,
+                                         void *matrix_scratch, uint64_t scratch_bytes,
+                                         uint32_t rows, uint32_t columns,
+                                         const float *input, float *out) {
+    if (!model || !matrix_scratch || !input || !out || rows == 0u || columns == 0u) return LM_ERR_ARGUMENT;
+    if (static_cast<uint64_t>(rows) > UINT64_MAX / columns) return LM_ERR_CAPACITY;
+    const uint64_t elements = static_cast<uint64_t>(rows) * columns;
+    if (elements > UINT64_MAX / sizeof(float)) return LM_ERR_CAPACITY;
+    const uint64_t bytes = elements * sizeof(float);
+    if (bytes > scratch_bytes || bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+        return LM_ERR_CAPACITY;
+    lm_model_tensor_info descriptor{};
+    lm_status status = lm_model_tensor_info_at(model, tensor_index, &descriptor);
+    if (status != LM_OK) return status;
+    if (descriptor.rank != 2u || descriptor.type != LM_DTYPE_F32 || descriptor.dims[0] != rows ||
+        descriptor.dims[1] != columns) return LM_ERR_UNSUPPORTED;
+    lm_file_span span{};
+    status = lm_model_tensor_span(model, descriptor.relative_offset, bytes, &span);
+    if (status != LM_OK) return status;
+    status = lm_file_span_read(&span, 0u, matrix_scratch, static_cast<size_t>(bytes));
+    if (status != LM_OK) return status;
+    const float *matrix = static_cast<const float *>(matrix_scratch);
+    for (uint32_t column = 0u; column < columns; ++column) {
+        float sum = 0.0f;
+        for (uint32_t row = 0u; row < rows; ++row) sum += input[row] * matrix[static_cast<size_t>(row) * columns + column];
+        if (!std::isfinite(sum)) return LM_ERR_RANGE;
+        out[column] = sum;
+    }
+    return LM_OK;
+}
+
 static lm_status validate_q4_k_binding_matvec(const lm_model_tensor_binding *binding,
                                                 uint32_t rows, uint32_t columns,
                                                 uint64_t *payload_bytes, uint32_t *blocks_per_row) {

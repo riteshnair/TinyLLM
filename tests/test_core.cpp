@@ -76,6 +76,23 @@ static void test_vulkan_backend_resolution() {
     } else {
         assert(created == LM_ERR_UNSUPPORTED && runtime == nullptr);
     }
+    lm_config auto_config;
+    lm_config_init(&auto_config);
+    lm_runtime *auto_runtime = nullptr;
+    assert(lm_runtime_create(&auto_config, &auto_runtime) == LM_OK);
+    FILE *dump = std::tmpfile();
+    assert(dump != nullptr);
+    assert(lm_runtime_dump_config(auto_runtime, dump) == LM_OK);
+    std::rewind(dump);
+    char dump_text[128] = {};
+    const size_t read = std::fread(dump_text, 1u, sizeof(dump_text) - 1u, dump);
+    dump_text[read] = '\0';
+    if (discovered == LM_OK && device_count > 0u)
+        assert(std::strstr(dump_text, "backend=vulkan") != nullptr);
+    else
+        assert(std::strstr(dump_text, "backend=cpu") != nullptr);
+    std::fclose(dump);
+    lm_runtime_destroy(auto_runtime);
 }
 
 static void test_tensor_and_buffer() {
@@ -699,27 +716,38 @@ static void test_model_and_cpu_math() {
 
 static void test_safetensors_parser() {
     const char *valid_path = "test-fixture.safetensors";
-    const char *json = "{\"x\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
+    const char *json = "{\"x\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]},\"m\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[8,24]}}";
     {
         std::ofstream file(valid_path, std::ios::binary);
         const uint64_t header_bytes = std::strlen(json);
         file.write(reinterpret_cast<const char *>(&header_bytes), sizeof(header_bytes));
         file.write(json, static_cast<std::streamsize>(header_bytes));
+        const float matrix[] = {1.0f, 2.0f, 3.0f, 4.0f};
         const unsigned char data[8] = {};
         file.write(reinterpret_cast<const char *>(data), sizeof(data));
+        file.write(reinterpret_cast<const char *>(matrix), sizeof(matrix));
     }
     lm_model_info info{};
     char error[128] = {};
     assert(lm_model_inspect(valid_path, &info, error, sizeof(error)) == LM_OK);
-    assert(info.format == LM_MODEL_SAFETENSORS && info.tensor_count == 1u);
+    assert(info.format == LM_MODEL_SAFETENSORS && info.tensor_count == 2u);
     lm_model_file *model = nullptr;
     assert(lm_model_open(valid_path, &model, error, sizeof(error)) == LM_OK);
     lm_model_tensor_info descriptor{};
     assert(lm_model_tensor_info_at(model, 0u, &descriptor) == LM_OK);
     assert(std::strcmp(descriptor.name, "x") == 0 && descriptor.rank == 1u && descriptor.dims[0] == 2u && descriptor.type == LM_DTYPE_F32 && descriptor.relative_offset == 0u);
-    assert(lm_model_tensor_info_at(model, 1u, &descriptor) == LM_ERR_RANGE);
+    assert(lm_model_tensor_info_at(model, 1u, &descriptor) == LM_OK);
+    assert(std::strcmp(descriptor.name, "m") == 0 && descriptor.rank == 2u && descriptor.dims[0] == 2u && descriptor.dims[1] == 2u);
     lm_model_tensor_binding binding{};
     assert(lm_model_tensor_bind_native(model, 0u, &binding) == LM_ERR_UNSUPPORTED);
+    float matrix_scratch[4] = {};
+    const float input[] = {1.0f, 2.0f};
+    float output[2] = {};
+    assert(lm_model_tensor_matvec_f32_cpu(model, 1u, matrix_scratch, sizeof(matrix_scratch),
+                                          2u, 2u, input, output) == LM_OK);
+    assert(output[0] == 7.0f && output[1] == 10.0f);
+    assert(lm_model_tensor_matvec_f32_cpu(model, 1u, matrix_scratch, sizeof(float),
+                                          2u, 2u, input, output) == LM_ERR_CAPACITY);
     lm_model_close(model);
     std::remove(valid_path);
 

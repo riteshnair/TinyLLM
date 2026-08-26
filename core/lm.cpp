@@ -216,7 +216,13 @@ lm_status lm_runtime_create(const lm_config *config, lm_runtime **out_runtime) {
     lm_runtime *runtime = static_cast<lm_runtime *>(std::calloc(1u, sizeof(*runtime)));
     if (!runtime) return LM_ERR_CAPACITY;
     runtime->config = *config;
-    runtime->config.resolved_backend = config->backend == LM_BACKEND_AUTO ? LM_BACKEND_CPU : config->backend;
+    runtime->config.resolved_backend = config->backend;
+    if (config->backend == LM_BACKEND_AUTO) {
+        uint32_t device_count = 0u;
+        const lm_status discovered = lm_vulkan_device_count(&device_count);
+        runtime->config.resolved_backend = discovered == LM_OK && device_count > 0u
+            ? LM_BACKEND_VULKAN : LM_BACKEND_CPU;
+    }
     runtime->next_trace_id = 1u;
     if (config->weight_policy == LM_WEIGHT_QUANTIZE_CACHE) {
         std::free(runtime);

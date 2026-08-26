@@ -342,6 +342,10 @@ lm_status lm_model_tensor_matvec_native(const lm_model_file *model, uint64_t ten
                                         void *packed_scratch, uint64_t scratch_bytes,
                                         uint32_t rows, uint32_t columns,
                                         const float *input, float *out);
+lm_status lm_model_tensor_matvec_f32_cpu(const lm_model_file *model, uint64_t tensor_index,
+                                         void *matrix_scratch, uint64_t scratch_bytes,
+                                         uint32_t rows, uint32_t columns,
+                                         const float *input, float *out);
 
 
 void lm_config_init(lm_config *config);
