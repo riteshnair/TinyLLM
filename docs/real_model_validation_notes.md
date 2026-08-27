@@ -66,3 +66,16 @@ These controls are implemented in the narrow native path. Chunked prefill is a s
 The repaired generation path was exercised from the repository root after adding generation-owned sampling history, an optional advancing deterministic RNG state, the reusable allowlist processor, synchronous generation trace events, and defensive failure-state handling. The traced real GGUF CPU run used `--trace --attention-window 2 --rope-scale 2 --prefill-chunk-tokens 1` and returned `generated=..` with ordered events `stage=1 bytes=4`, `stage=2 bytes=4`, `stage=3 bytes=4`, `stage=3 bytes=4`, and `stage=4 bytes=0`. The corresponding configured GGUF Vulkan/llvmpipe and standard-HF SafeTensors CPU runs also completed successfully with `generated=..` and `generated=ino película`, respectively.
 
 The unit suite additionally proves that native sampling processors observe history counts of 2, 3, and 4 across a three-token generation, that an explicitly supplied RNG state advances across repeated stochastic calls, that the allowlist processor masks only disallowed IDs, and that failed native generation calls leave the output count at zero. Prefix-cache import was tested with a deliberately unaligned serialized buffer.
+
+## Exact two-part prompt repair
+
+The embedded GGUF tokenizer previously used raw longest-vocabulary matching and returned `LM_ERR_UNSUPPORTED` for the valid multi-word prompt `1) What is the capital of France?\n\n2) Once upon a tie`. GGUF metadata inspection showed `tokenizer.ggml.model=gpt2`, `tokenizer.ggml.pre=smollm`, and 48,900 merge entries. TinyLLM now constructs a strict byte-level GPT-2 BPE tokenizer for this verified metadata combination, applies the stored merge ranks, maps spaces/newlines through the GPT-2 byte alphabet, and reverses the mapping during decode. A synthetic GGUF fixture covers space-marker merges and newline round trips.
+
+The exact prompt now completes successfully with the real SmolLM Q8_0 GGUF model on both CPU and Vulkan/llvmpipe:
+
+| Backend | Prompt | New tokens | Result |
+|---|---|---:|---|
+| CPU | `1) What is the capital of France?` followed by `2) Once upon a tie` | 24 | **PASS**, exit 0, `generated=,` |
+| Vulkan via llvmpipe | same exact prompt | 24 | **PASS**, exit 0, `generated=,` |
+
+The generated comma is the model’s deterministic continuation for this build/configuration; it is not a quality claim. The important repaired boundary is successful prompt encoding and end-to-end execution without the previous unsupported error.

@@ -1782,6 +1782,54 @@ static void test_tokenizer() {
     std::remove(path);
 }
 
+static void test_gguf_gpt2_tokenizer() {
+    auto put_u32 = [](std::vector<unsigned char> *bytes, uint32_t value) {
+        for (unsigned i = 0u; i < 4u; ++i) bytes->push_back(static_cast<unsigned char>((value >> (8u * i)) & 0xffu));
+    };
+    auto put_u64 = [](std::vector<unsigned char> *bytes, uint64_t value) {
+        for (unsigned i = 0u; i < 8u; ++i) bytes->push_back(static_cast<unsigned char>((value >> (8u * i)) & 0xffu));
+    };
+    auto put_string = [&](std::vector<unsigned char> *bytes, const char *value) {
+        const size_t length = std::strlen(value);
+        put_u64(bytes, length);
+        bytes->insert(bytes->end(), value, value + length);
+    };
+    auto put_string_array = [&](std::vector<unsigned char> *bytes, const std::vector<const char *> &values) {
+        put_u32(bytes, 8u); put_u64(bytes, values.size());
+        for (const char *value : values) put_string(bytes, value);
+    };
+    const char *tokens[] = {"A", "B", "Ġ", "ĠB", "1", ")", "Ċ"};
+    std::vector<unsigned char> gguf(24u, 0u);
+    gguf[0] = 'G'; gguf[1] = 'G'; gguf[2] = 'U'; gguf[3] = 'F'; gguf[4] = 3u;
+    gguf[16] = 4u;
+    put_string(&gguf, "tokenizer.ggml.tokens"); put_u32(&gguf, 9u);
+    std::vector<const char *> token_values(tokens, tokens + 7u);
+    put_string_array(&gguf, token_values);
+    put_string(&gguf, "tokenizer.ggml.merges"); put_u32(&gguf, 9u);
+    put_string_array(&gguf, {"Ġ B"});
+    put_string(&gguf, "tokenizer.ggml.model"); put_u32(&gguf, 8u); put_string(&gguf, "gpt2");
+    put_string(&gguf, "tokenizer.ggml.pre"); put_u32(&gguf, 8u); put_string(&gguf, "smollm");
+    gguf.resize((gguf.size() + 31u) & ~static_cast<size_t>(31u), 0u);
+    const char *path = "test-gguf-gpt2-tokenizer.gguf";
+    { std::ofstream file(path, std::ios::binary); file.write(reinterpret_cast<const char *>(gguf.data()), static_cast<std::streamsize>(gguf.size())); }
+    char error[128] = {};
+    lm_model_file *model = nullptr;
+    assert(lm_model_open(path, &model, error, sizeof(error)) == LM_OK);
+    uint32_t vocabulary_size = 0u;
+    assert(lm_model_token_count(model, &vocabulary_size) == LM_OK && vocabulary_size == 7u);
+    const char text[] = "A B\n";
+    uint32_t encoded[8] = {};
+    size_t encoded_count = 0u;
+    assert(lm_model_token_encode(model, text, sizeof(text) - 1u, encoded, 8u, &encoded_count) == LM_OK);
+    assert(encoded_count == 3u && encoded[0] == 0u && encoded[1] == 3u && encoded[2] == 6u);
+    char decoded[8] = {};
+    size_t decoded_bytes = 0u;
+    assert(lm_model_token_decode(model, encoded, encoded_count, decoded, sizeof(decoded), &decoded_bytes) == LM_OK);
+    assert(decoded_bytes == sizeof(text) - 1u && std::memcmp(decoded, text, decoded_bytes) == 0);
+    lm_model_close(model);
+    std::remove(path);
+}
+
 struct MaskProcessorState {
     uint32_t token;
     lm_status status;
@@ -2450,6 +2498,7 @@ int main() {
     test_model_bound_f32_router();
     test_tokenizer_json_bpe();
     test_tokenizer();
+    test_gguf_gpt2_tokenizer();
     test_sampling();
     test_cpu_decoder();
     test_moe_router();

@@ -235,6 +235,57 @@ bool parse_merge(const JsonValue &value, std::string *left, std::string *right) 
     return false;
 }
 
+bool next_utf8(const char *text, size_t bytes, size_t *position, std::string *symbol);
+
+uint32_t gpt2_byte_codepoint(uint8_t byte) {
+    uint32_t synthetic = 0u;
+    for (uint32_t value = 0u; value < 256u; ++value) {
+        const bool direct = (value >= 33u && value <= 126u) ||
+                            (value >= 161u && value <= 172u) ||
+                            (value >= 174u && value <= 255u);
+        const uint32_t codepoint = direct ? value : 256u + synthetic++;
+        if (value == byte) return codepoint;
+    }
+    return 0u;
+}
+
+bool gpt2_codepoint_byte(uint32_t codepoint, uint8_t *out_byte) {
+    if (!out_byte) return false;
+    for (uint32_t value = 0u; value < 256u; ++value)
+        if (gpt2_byte_codepoint(static_cast<uint8_t>(value)) == codepoint) {
+            *out_byte = static_cast<uint8_t>(value);
+            return true;
+        }
+    return false;
+}
+
+bool parse_merge_text(const std::string &value, std::string *left, std::string *right) {
+    if (!left || !right) return false;
+    const size_t split = value.find(' ');
+    return split != std::string::npos && split != 0u && split + 1u < value.size() &&
+           value.find(' ', split + 1u) == std::string::npos &&
+           (left->assign(value, 0u, split), right->assign(value, split + 1u), true);
+}
+
+bool decode_gpt2_token(const std::string &token, std::string *out) {
+    if (!out) return false;
+    size_t position = 0u;
+    while (position < token.size()) {
+        std::string symbol;
+        if (!next_utf8(token.data(), token.size(), &position, &symbol)) return false;
+        uint32_t codepoint = 0u;
+        const unsigned char first = static_cast<unsigned char>(symbol[0]);
+        if (symbol.size() == 1u) codepoint = first;
+        else if (symbol.size() == 2u) codepoint = ((first & 0x1fu) << 6u) | (static_cast<unsigned char>(symbol[1]) & 0x3fu);
+        else if (symbol.size() == 3u) codepoint = ((first & 0x0fu) << 12u) | ((static_cast<unsigned char>(symbol[1]) & 0x3fu) << 6u) | (static_cast<unsigned char>(symbol[2]) & 0x3fu);
+        else codepoint = ((first & 0x07u) << 18u) | ((static_cast<unsigned char>(symbol[1]) & 0x3fu) << 12u) | ((static_cast<unsigned char>(symbol[2]) & 0x3fu) << 6u) | (static_cast<unsigned char>(symbol[3]) & 0x3fu);
+        uint8_t byte = 0u;
+        if (!gpt2_codepoint_byte(codepoint, &byte)) return false;
+        out->push_back(static_cast<char>(byte));
+    }
+    return true;
+}
+
 bool valid_utf8(const std::string &text) {
     for (size_t i = 0u; i < text.size();) {
         const unsigned char c = static_cast<unsigned char>(text[i++]); uint32_t count = 0u, codepoint = 0u;
@@ -308,6 +359,7 @@ struct lm_tokenizer {
     uint8_t unk_present = 0u;
     uint32_t unk_id = 0u;
     uint8_t sentencepiece = 0u;
+    uint8_t byte_level = 0u;
     uint8_t byte_fallback = 0u;
     uint8_t fuse_unk = 0u;
     uint8_t add_bos = 0u;
@@ -405,11 +457,53 @@ lm_status lm_tokenizer_open_json(const char *path, lm_tokenizer **out_tokenizer,
 
 void lm_tokenizer_destroy(lm_tokenizer *tokenizer) { delete tokenizer; }
 
+lm_status lm_tokenizer_create_gpt2(const std::vector<std::string> &vocabulary,
+                                   const std::vector<std::string> &merge_strings,
+                                   uint8_t add_bos, uint32_t bos_id,
+                                   lm_tokenizer **out_tokenizer) {
+    if (!out_tokenizer || vocabulary.empty() || vocabulary.size() > kMaxVocabulary ||
+        merge_strings.size() > kMaxMerges) return LM_ERR_ARGUMENT;
+    *out_tokenizer = nullptr;
+    lm_tokenizer *tokenizer = new (std::nothrow) lm_tokenizer();
+    if (!tokenizer) return LM_ERR_CAPACITY;
+    tokenizer->id_to_token = vocabulary;
+    tokenizer->byte_level = 1u;
+    tokenizer->add_bos = add_bos;
+    tokenizer->bos_id = bos_id;
+    try {
+        tokenizer->token_to_id.reserve(vocabulary.size());
+        for (uint32_t id = 0u; id < vocabulary.size(); ++id)
+            if (vocabulary[id].empty() || !valid_utf8(vocabulary[id]) ||
+                !tokenizer->token_to_id.emplace(vocabulary[id], id).second) {
+                delete tokenizer; return LM_ERR_PARSE;
+            }
+        tokenizer->merges.clear();
+        for (size_t rank = 0u; rank < merge_strings.size(); ++rank) {
+            std::string left, right;
+            if (!parse_merge_text(merge_strings[rank], &left, &right)) { delete tokenizer; return LM_ERR_PARSE; }
+            const auto left_id = tokenizer->token_to_id.find(left);
+            const auto right_id = tokenizer->token_to_id.find(right);
+            const std::string output = left + right;
+            const auto output_id = tokenizer->token_to_id.find(output);
+            if (left_id == tokenizer->token_to_id.end() || right_id == tokenizer->token_to_id.end() ||
+                output_id == tokenizer->token_to_id.end() || rank > UINT32_MAX ||
+                !tokenizer->merges.emplace(Pair{left_id->second, right_id->second},
+                                           Merge{static_cast<uint32_t>(rank), output_id->second}).second) {
+                delete tokenizer; return LM_ERR_PARSE;
+            }
+        }
+    } catch (const std::bad_alloc &) {
+        delete tokenizer; return LM_ERR_CAPACITY;
+    }
+    *out_tokenizer = tokenizer;
+    return LM_OK;
+}
+
 lm_status lm_tokenizer_get_info(const lm_tokenizer *tokenizer, lm_tokenizer_info *out_info) {
     if (!tokenizer || !out_info) return LM_ERR_ARGUMENT;
     out_info->vocabulary_size = tokenizer->token_to_id.size() > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(tokenizer->token_to_id.size());
     out_info->merge_count = tokenizer->merges.size() > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(tokenizer->merges.size());
-    out_info->raw_utf8_bpe = 1u;
+    out_info->raw_utf8_bpe = tokenizer->byte_level == 0u ? 1u : 0u;
     return LM_OK;
 }
 
@@ -422,6 +516,14 @@ lm_status lm_tokenizer_encode(const lm_tokenizer *tokenizer, const char *text, s
     if (tokenizer->sentencepiece) {
         if (text_bytes != 0u && !normalize_sentencepiece(text, text_bytes, &normalized)) return LM_ERR_PARSE;
         if (text_bytes != 0u) { source = normalized.data(); source_bytes = normalized.size(); }
+    } else if (tokenizer->byte_level) {
+        try {
+            normalized.clear();
+            normalized.reserve(text_bytes);
+            for (size_t i = 0u; i < text_bytes; ++i) append_codepoint(&normalized, gpt2_byte_codepoint(static_cast<uint8_t>(text[i])));
+            source = normalized.data();
+            source_bytes = normalized.size();
+        } catch (const std::bad_alloc &) { return LM_ERR_CAPACITY; }
     }
     if (text_bytes == 0u && !tokenizer->add_bos) return LM_OK;
     if (!out_tokens || token_capacity == 0u) return LM_ERR_CAPACITY;
@@ -472,7 +574,10 @@ lm_status lm_tokenizer_decode(const lm_tokenizer *tokenizer, const uint32_t *tok
             const std::string &value = tokenizer->id_to_token[tokens[i]];
             if (tokenizer->sentencepiece && (value == "<s>" || value == "</s>")) continue;
             std::string byte;
-            if (tokenizer->sentencepiece && decode_byte_fallback(value, &byte)) decoded.append(byte);
+            if (tokenizer->byte_level) {
+                if (value.size() >= 4u && value.front() == '<' && value.back() == '>') decoded.append(value);
+                else if (!decode_gpt2_token(value, &decoded)) return LM_ERR_UNSUPPORTED;
+            } else if (tokenizer->sentencepiece && decode_byte_fallback(value, &byte)) decoded.append(byte);
             else decoded.append(value);
         }
         if (tokenizer->sentencepiece) {

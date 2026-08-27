@@ -12,6 +12,10 @@
 #include <vector>
 
 float half_to_float(uint16_t bits);
+lm_status lm_tokenizer_create_gpt2(const std::vector<std::string> &vocabulary,
+                                   const std::vector<std::string> &merge_strings,
+                                   uint8_t add_bos, uint32_t bos_id,
+                                   lm_tokenizer **out_tokenizer);
 
 struct lm_model_file {
     lm_file *file;
@@ -270,6 +274,25 @@ bool read_arch_float(BinaryReader &reader, uint32_t type, float *value) {
     return false;
 }
 
+bool read_string_array(BinaryReader &reader, uint32_t type, std::vector<std::string> *strings) {
+    if (type != 9u || !strings) return false;
+    uint32_t element_type = 0u;
+    uint64_t length = 0u;
+    if (!reader.u32(&element_type) || !reader.u64(&length) || element_type != 8u ||
+        length > kMaxContainerItems) return false;
+    std::vector<std::string> parsed;
+    try {
+        parsed.reserve(static_cast<size_t>(length));
+        for (uint64_t i = 0u; i < length; ++i) {
+            std::string value;
+            if (!reader.string(&value, kMaxVocabularyTokenBytes)) return false;
+            parsed.push_back(std::move(value));
+        }
+    } catch (const std::bad_alloc &) { return false; }
+    *strings = std::move(parsed);
+    return true;
+}
+
 bool read_token_array(BinaryReader &reader, uint32_t type, std::vector<std::string> *tokens) {
     if (type != 9u || !tokens) return false;
     uint32_t element_type = 0u;
@@ -296,7 +319,9 @@ lm_status inspect_gguf(const char *path, lm_model_info *out_info, char *error_te
                        std::vector<lm_model_tensor_info> *out_tensors = nullptr,
                        std::vector<std::string> *out_tokens = nullptr,
                        lm_model_architecture *out_architecture = nullptr,
-                       GgufSplitInfo *out_split = nullptr) {
+                       GgufSplitInfo *out_split = nullptr,
+                       std::vector<std::string> *out_merges = nullptr,
+                       bool *out_gpt2_tokenizer = nullptr) {
     BinaryReader reader(path);
     if (!reader.good()) { set_error(error_text, error_capacity, "cannot open model file"); return LM_ERR_IO; }
     if (reader.size() < 24u) { set_error(error_text, error_capacity, "GGUF header is truncated"); return LM_ERR_PARSE; }
@@ -319,6 +344,11 @@ lm_status inspect_gguf(const char *path, lm_model_info *out_info, char *error_te
     bool has_experts_per_token = false;
     GgufSplitInfo split;
     std::vector<std::string> tokens;
+    std::vector<std::string> merges;
+    bool gpt2_tokenizer = false;
+    bool smollm_pre = false;
+    bool add_bos_token = false;
+    bool add_space_prefix = false;
     lm_model_architecture architecture{};
     architecture.rms_epsilon = 1.0e-5f;
     bool is_llama = false;
@@ -378,6 +408,30 @@ lm_status inspect_gguf(const char *path, lm_model_info *out_info, char *error_te
             if (!tokens.empty() || !read_token_array(reader, type, &tokens)) {
                 set_error(error_text, error_capacity, "invalid GGUF token vocabulary metadata"); return LM_ERR_PARSE;
             }
+        } else if (key == "tokenizer.ggml.merges") {
+            if (!merges.empty() || !read_string_array(reader, type, &merges)) {
+                set_error(error_text, error_capacity, "invalid GGUF tokenizer merge metadata"); return LM_ERR_PARSE;
+            }
+        } else if (key == "tokenizer.ggml.model") {
+            std::string model_name;
+            if (type != 8u || !reader.string(&model_name, 64u)) {
+                set_error(error_text, error_capacity, "invalid GGUF tokenizer model metadata"); return LM_ERR_PARSE;
+            }
+            gpt2_tokenizer = model_name == "gpt2";
+        } else if (key == "tokenizer.ggml.pre") {
+            std::string pre_name;
+            if (type != 8u || !reader.string(&pre_name, 64u)) {
+                set_error(error_text, error_capacity, "invalid GGUF tokenizer preprocessor metadata"); return LM_ERR_PARSE;
+            }
+            smollm_pre = pre_name == "smollm";
+        } else if (key == "tokenizer.ggml.add_bos_token") {
+            uint8_t value = 0u;
+            if (type != 7u || !reader.u8(&value)) return LM_ERR_PARSE;
+            add_bos_token = value != 0u;
+        } else if (key == "tokenizer.ggml.add_space_prefix") {
+            uint8_t value = 0u;
+            if (type != 7u || !reader.u8(&value)) return LM_ERR_PARSE;
+            add_space_prefix = value != 0u;
         } else if (key == "llama.context_length") {
             if (has_context_length || !read_arch_u32(reader, type, &architecture.context_length)) return LM_ERR_PARSE;
             has_context_length = true;
@@ -489,8 +543,12 @@ lm_status inspect_gguf(const char *path, lm_model_info *out_info, char *error_te
             set_error(error_text, error_capacity, "native GGUF tensor payload exceeds its bounded range"); return LM_ERR_PARSE;
         }
     }
+    const bool use_gpt2_tokenizer = gpt2_tokenizer && smollm_pre &&
+        !add_bos_token && !add_space_prefix && !merges.empty();
     if (out_tensors) *out_tensors = std::move(parsed_tensors);
     if (out_tokens) *out_tokens = std::move(tokens);
+    if (out_merges) *out_merges = std::move(merges);
+    if (out_gpt2_tokenizer) *out_gpt2_tokenizer = use_gpt2_tokenizer;
     out_info->format = LM_MODEL_GGUF;
     out_info->version = version;
     out_info->file_bytes = reader.size();
@@ -834,9 +892,12 @@ lm_status lm_model_open(const char *path, lm_model_file **out_model, char *error
     lm_file *file = nullptr;
     std::vector<lm_model_tensor_info> tensors;
     std::vector<std::string> tokens;
+    std::vector<std::string> merges;
+    bool gpt2_tokenizer = false;
     lm_model_architecture architecture{};
     if (info.format == LM_MODEL_GGUF) {
-        const lm_status descriptors = inspect_gguf(path, &info, error_text, error_capacity, &tensors, &tokens, &architecture);
+        const lm_status descriptors = inspect_gguf(path, &info, error_text, error_capacity, &tensors, &tokens, &architecture,
+                                                    nullptr, &merges, &gpt2_tokenizer);
         if (descriptors != LM_OK) return descriptors;
     } else if (info.format == LM_MODEL_SAFETENSORS) {
         const lm_status descriptors = inspect_safetensors(path, &info, error_text, error_capacity, &tensors, &tokens, &architecture);
@@ -850,6 +911,11 @@ lm_status lm_model_open(const char *path, lm_model_file **out_model, char *error
                                                    std::move(tensors), std::move(tokens),
                                                    std::vector<uint64_t>{info.header_bytes},
                                                    std::vector<uint64_t>{info.file_bytes}};
+        if (gpt2_tokenizer) {
+            const lm_status tokenizer_status = lm_tokenizer_create_gpt2(model->tokens, merges, 0u, 0u,
+                                                                          &model->tokenizer);
+            if (tokenizer_status != LM_OK) { lm_model_close(model); return tokenizer_status; }
+        }
         *out_model = model;
         return LM_OK;
     } catch (const std::bad_alloc &) {
@@ -932,6 +998,8 @@ lm_status lm_model_open_sharded(const char *const *paths, size_t path_count,
     lm_model_info combined{};
     std::vector<lm_model_tensor_info> tensors;
     std::vector<std::string> tokens;
+    std::vector<std::string> merges;
+    bool gpt2_tokenizer = false;
     std::vector<uint64_t> headers;
     std::vector<uint64_t> sizes;
     lm_model_architecture architecture{};
@@ -943,8 +1011,11 @@ lm_status lm_model_open_sharded(const char *const *paths, size_t path_count,
         GgufSplitInfo part_split{};
         std::vector<lm_model_tensor_info> part_tensors;
         std::vector<std::string> part_tokens;
+        std::vector<std::string> part_merges;
+        bool part_gpt2_tokenizer = false;
         const lm_status parsed = inspect_gguf(paths[shard], &part_info, error_text, error_capacity,
-                                              &part_tensors, &part_tokens, &part_architecture, &part_split);
+                                              &part_tensors, &part_tokens, &part_architecture, &part_split,
+                                              &part_merges, &part_gpt2_tokenizer);
         if (parsed != LM_OK) return parsed;
         if (part_info.format != LM_MODEL_GGUF || !part_split.has_count || !part_split.has_number ||
             !part_split.has_tensor_count || part_split.count != path_count || part_split.number != shard ||
@@ -956,6 +1027,8 @@ lm_status lm_model_open_sharded(const char *const *paths, size_t path_count,
             expected_split = part_split;
             architecture = part_architecture;
             tokens = std::move(part_tokens);
+            merges = std::move(part_merges);
+            gpt2_tokenizer = part_gpt2_tokenizer;
         } else {
             const bool architecture_mismatch = architecture.context_length != part_architecture.context_length ||
                 architecture.embedding_length != part_architecture.embedding_length ||
@@ -964,7 +1037,8 @@ lm_status lm_model_open_sharded(const char *const *paths, size_t path_count,
                 architecture.head_count_kv != part_architecture.head_count_kv ||
                 architecture.intermediate_length != part_architecture.intermediate_length ||
                 architecture.rope_frequency_base != part_architecture.rope_frequency_base;
-            if (architecture_mismatch || part_tokens != tokens) {
+            if (architecture_mismatch || part_tokens != tokens || part_merges != merges ||
+                part_gpt2_tokenizer != gpt2_tokenizer) {
                 set_error(error_text, error_capacity, "inconsistent GGUF split metadata"); return LM_ERR_PARSE;
             }
             if (part_split.tensor_count != expected_split.tensor_count) {
@@ -1001,6 +1075,11 @@ lm_status lm_model_open_sharded(const char *const *paths, size_t path_count,
                                                    static_cast<uint8_t>(architecture.block_count != 0u), 0u,
                                                    std::move(tensors), std::move(tokens),
                                                    std::move(headers), std::move(sizes)};
+        if (gpt2_tokenizer) {
+            const lm_status tokenizer_status = lm_tokenizer_create_gpt2(model->tokens, merges, 0u, 0u,
+                                                                          &model->tokenizer);
+            if (tokenizer_status != LM_OK) { lm_model_close(model); return tokenizer_status; }
+        }
         *out_model = model;
         return LM_OK;
     } catch (const std::bad_alloc &) {
