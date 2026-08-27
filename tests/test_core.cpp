@@ -16,6 +16,13 @@ static void capture_probe(void *user, const lm_probe *probe) {
     state->last_stage = probe->stage;
 }
 
+struct GenerationTrace { std::vector<lm_probe> probes; };
+
+static void capture_generation_trace(void *user, const lm_probe *probe) {
+    GenerationTrace *trace = static_cast<GenerationTrace *>(user);
+    if (trace && probe) trace->probes.push_back(*probe);
+}
+
 struct TokenCapture { std::vector<uint32_t> tokens; std::vector<float> probabilities; };
 
 static lm_status capture_token(void *user, uint32_t token_id, float probability) {
@@ -23,6 +30,16 @@ static lm_status capture_token(void *user, uint32_t token_id, float probability)
     if (!capture || !std::isfinite(probability)) return LM_ERR_RANGE;
     capture->tokens.push_back(token_id);
     capture->probabilities.push_back(probability);
+    return LM_OK;
+}
+
+struct HistoryProbe { std::vector<size_t> counts; };
+
+static lm_status observe_history(void *user, float *, uint32_t,
+                                 const uint32_t *, size_t history_count) {
+    HistoryProbe *probe = static_cast<HistoryProbe *>(user);
+    if (!probe) return LM_ERR_ARGUMENT;
+    probe->counts.push_back(history_count);
     return LM_OK;
 }
 
@@ -918,6 +935,75 @@ static void test_safetensors_native_mlp() {
     std::remove(path);
 }
 
+static void test_safetensors_tied_output() {
+    const char *path = "test-tied-output.safetensors";
+    const char *config_path = "test-tied-output-config.json";
+    const char *base_json = "{\"__metadata__\":{\"general.architecture\":\"llama\",\"tokenizer.token.0\":\"a\",\"tokenizer.token.1\":\"b\"},\"token_embd.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,16]},\"output.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[16,32]},\"output_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[32,40]},\"blk.0.attn_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[40,48]},\"blk.0.attn_q.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[48,64]},\"blk.0.attn_k.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[64,80]},\"blk.0.attn_v.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[80,96]},\"blk.0.attn_output.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[96,112]},\"blk.0.ffn_norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[112,120]},\"blk.0.ffn_gate.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[120,136]},\"blk.0.ffn_down.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[136,152]},\"blk.0.ffn_up.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[152,168]}}";
+    std::string tied_json(base_json);
+    const size_t output_begin = tied_json.find(",\"output.weight\"");
+    const size_t output_end = tied_json.find(",\"output_norm.weight\"", output_begin);
+    assert(output_begin != std::string::npos && output_end != std::string::npos);
+    tied_json.erase(output_begin, output_end - output_begin);
+    {
+        std::ofstream file(path, std::ios::binary);
+        const uint64_t header_bytes = tied_json.size();
+        file.write(reinterpret_cast<const char *>(&header_bytes), sizeof(header_bytes));
+        file.write(tied_json.data(), static_cast<std::streamsize>(tied_json.size()));
+        std::vector<float> payload(42u, 0.0f);
+        file.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size() * sizeof(float)));
+    }
+    const char *config_true = "{\"model_type\":\"llama\",\"hidden_size\":2,\"intermediate_size\":2,\"num_hidden_layers\":1,\"num_attention_heads\":1,\"num_key_value_heads\":1,\"max_position_embeddings\":4,\"vocab_size\":2,\"rms_norm_eps\":0.00001,\"rope_theta\":10000,\"tie_word_embeddings\":true}";
+    const char *config_false = "{\"model_type\":\"llama\",\"hidden_size\":2,\"intermediate_size\":2,\"num_hidden_layers\":1,\"num_attention_heads\":1,\"num_key_value_heads\":1,\"max_position_embeddings\":4,\"vocab_size\":2,\"rms_norm_eps\":0.00001,\"rope_theta\":10000,\"tie_word_embeddings\":false}";
+    {
+        std::ofstream file(config_path, std::ios::binary);
+        file << config_true;
+    }
+    char error[128] = {};
+    lm_model_file *model = nullptr;
+    assert(lm_model_open(path, &model, error, sizeof(error)) == LM_OK);
+    assert(lm_model_set_hf_config_json(model, config_path, error, sizeof(error)) == LM_OK);
+    lm_decoder_graph_binding graph{};
+    assert(lm_model_build_llama_graph(model, &graph) == LM_OK && graph.output_tied != 0u &&
+           graph.output == graph.token_embedding);
+    lm_native_generation_config generation{};
+    generation.step.matvec = {LM_BACKEND_CPU, 0u, nullptr, nullptr};
+    generation.step.layer_index = 0u;
+    generation.step.vocab_size = 2u;
+    generation.step.hidden_size = 2u;
+    generation.step.intermediate_size = 2u;
+    generation.step.head_count = 1u;
+    generation.step.head_count_kv = 1u;
+    generation.step.rope_theta = 10000.0f;
+    generation.step.rms_epsilon = 1.0e-5f;
+    generation.step.matrix_format = LM_QUANT_NONE;
+    generation.sampling.mode = LM_SAMPLING_GREEDY;
+    generation.sampling.temperature = 1.0f;
+    generation.max_new_tokens = 1u;
+    generation.has_architecture = 1u;
+    assert(lm_model_get_architecture(model, &generation.architecture) == LM_OK);
+    const uint32_t prompt_tokens[1] = {0u};
+    uint32_t generated_token[1] = {};
+    size_t generated_count = 0u;
+    unsigned char scratch[256] = {};
+    assert(lm_model_generate_native(model, &graph, &generation, prompt_tokens, 1u,
+                                    scratch, sizeof(scratch), generated_token, 1u,
+                                    &generated_count) == LM_OK);
+    assert(generated_count == 1u && generated_token[0] < 2u);
+    lm_model_close(model);
+    {
+        std::ofstream file(config_path, std::ios::binary | std::ios::trunc);
+        file << config_false;
+    }
+    model = nullptr;
+    assert(lm_model_open(path, &model, error, sizeof(error)) == LM_OK);
+    assert(lm_model_set_hf_config_json(model, config_path, error, sizeof(error)) == LM_OK);
+    std::memset(&graph, 0, sizeof(graph));
+    assert(lm_model_build_llama_graph(model, &graph) == LM_ERR_UNSUPPORTED);
+    lm_model_close(model);
+    std::remove(path);
+    std::remove(config_path);
+}
+
 static void test_model_bound_f32_router() {
     const char *path = "test-model-bound-router.safetensors";
     const char *json = "{\"router.weight\":{\"dtype\":\"F32\",\"shape\":[3,2],\"data_offsets\":[0,24]}}";
@@ -1225,6 +1311,32 @@ static void test_native_mlp_profile() {
     assert(lm_model_generate_native(model, &graph, &generation, prompt, 2u, scratch,
                                     sizeof(scratch), generated, 3u, &generated_count) == LM_OK);
     assert(generated_count == 3u && generated[0] == 1u && generated[1] == 1u && generated[2] == 1u);
+    HistoryProbe history_probe;
+    generation.sampling.processor = observe_history;
+    generation.sampling.processor_user = &history_probe;
+    generated_count = 0u;
+    assert(lm_model_generate_native(model, &graph, &generation, prompt, 2u, scratch,
+                                    sizeof(scratch), generated, 3u, &generated_count) == LM_OK);
+    assert(history_probe.counts.size() == 3u && history_probe.counts[0] == 2u &&
+           history_probe.counts[1] == 3u && history_probe.counts[2] == 4u);
+    generation.sampling.processor = nullptr;
+    generation.sampling.processor_user = nullptr;
+    GenerationTrace generation_trace;
+    generation.trace_sink = capture_generation_trace;
+    generation.trace_user = &generation_trace;
+    generated_count = 0u;
+    assert(lm_model_generate_native(model, &graph, &generation, prompt, 2u, scratch,
+                                    sizeof(scratch), generated, 3u, &generated_count) == LM_OK);
+    assert(generation_trace.probes.size() == 7u && generation_trace.probes[0].stage == 1u &&
+           generation_trace.probes[0].bytes == 8u && generation_trace.probes[1].stage == 2u &&
+           generation_trace.probes[2].stage == 2u && generation_trace.probes[3].stage == 3u &&
+           generation_trace.probes[4].stage == 3u && generation_trace.probes[5].stage == 3u &&
+           generation_trace.probes[6].stage == 4u && generation_trace.probes[6].flags == 0u &&
+           generation_trace.probes[6].timestamp_ns != 0u);
+    for (size_t i = 1u; i < generation_trace.probes.size(); ++i)
+        assert(generation_trace.probes[i].trace_id == generation_trace.probes[i - 1u].trace_id + 1u);
+    generation.trace_sink = nullptr;
+    generation.trace_user = nullptr;
     uint32_t chunked_generated[3] = {};
     size_t chunked_count = 0u;
     generation.prefill_chunk_tokens = 1u;
@@ -1271,8 +1383,19 @@ static void test_native_mlp_profile() {
                                          sizeof(scratch), generated_text, 3u,
                                          &generated_bytes) == LM_ERR_CAPACITY);
     const uint32_t bad_prompt[] = {vocab};
+    generated_count = 99u;
     assert(lm_model_generate_native(model, &graph, &generation, bad_prompt, 1u, scratch,
                                     sizeof(scratch), generated, 3u, &generated_count) == LM_ERR_RANGE);
+    assert(generated_count == 0u);
+    const uint32_t bad_history[] = {vocab};
+    generation.sampling.history_tokens = bad_history;
+    generation.sampling.history_count = 1u;
+    generated_count = 99u;
+    assert(lm_model_generate_native(model, &graph, &generation, prompt, 2u, scratch,
+                                    sizeof(scratch), generated, 3u, &generated_count) == LM_ERR_RANGE);
+    assert(generated_count == 0u);
+    generation.sampling.history_tokens = nullptr;
+    generation.sampling.history_count = 0u;
     if (lm_vulkan_device_count(&devices) == LM_OK && devices != 0u) {
         lm_native_mlp_config vulkan_config = config;
         vulkan_config.matvec = {LM_BACKEND_VULKAN, 0u, "matvec_q8_0_f32.comp.spv", nullptr};
@@ -1682,6 +1805,25 @@ static void test_sampling() {
     float probability = 0.0f;
     assert(lm_sample_logits(logits, 4u, &greedy, &token, &probability) == LM_OK);
     assert(token == 1u && probability == 1.0f);
+    const uint32_t allowed_ids[] = {0u, 2u};
+    lm_token_allowlist allowlist{allowed_ids, 2u};
+    float masked_logits[4] = {1.0f, 3.0f, 3.0f, -2.0f};
+    assert(lm_logits_allowlist_processor(&allowlist, masked_logits, 4u, nullptr, 0u) == LM_OK);
+    assert(masked_logits[0] == 1.0f && masked_logits[2] == 3.0f &&
+           std::isinf(masked_logits[1]) && masked_logits[1] < 0.0f &&
+           std::isinf(masked_logits[3]) && masked_logits[3] < 0.0f);
+    lm_sampling_config allowlist_sampling = greedy;
+    allowlist_sampling.processor = lm_logits_allowlist_processor;
+    allowlist_sampling.processor_user = &allowlist;
+    assert(lm_sample_logits(logits, 4u, &allowlist_sampling, &token, &probability) == LM_OK && token == 2u);
+    const uint32_t duplicate_ids[] = {1u, 1u};
+    lm_token_allowlist duplicate{duplicate_ids, 2u};
+    assert(lm_logits_allowlist_processor(&duplicate, masked_logits, 4u, nullptr, 0u) == LM_ERR_ARGUMENT);
+    const uint32_t out_of_range_id[] = {4u};
+    lm_token_allowlist out_of_range{out_of_range_id, 1u};
+    assert(lm_logits_allowlist_processor(&out_of_range, masked_logits, 4u, nullptr, 0u) == LM_ERR_RANGE);
+    lm_token_allowlist empty{nullptr, 0u};
+    assert(lm_logits_allowlist_processor(&empty, masked_logits, 4u, nullptr, 0u) == LM_ERR_ARGUMENT);
     lm_sampling_config top_k{};
     top_k.mode = LM_SAMPLING_TOP_K;
     top_k.top_k = 2u;
@@ -1695,6 +1837,13 @@ static void test_sampling() {
     float second_probability = 0.0f;
     assert(lm_sample_logits(logits, 4u, &top_k, &second_token, &second_probability) == LM_OK);
     assert(first_token == second_token && first_probability == second_probability);
+    uint64_t rng_state = top_k.seed;
+    lm_sampling_config stateful = top_k;
+    stateful.rng_state = &rng_state;
+    assert(lm_sample_logits(logits, 4u, &stateful, &token, &probability) == LM_OK);
+    const uint64_t advanced_state = rng_state;
+    assert(lm_sample_logits(logits, 4u, &stateful, &token, &probability) == LM_OK);
+    assert(rng_state != top_k.seed && rng_state != advanced_state);
     lm_sampling_config invalid = top_k;
     invalid.top_k = 5u;
     assert(lm_sample_logits(logits, 4u, &invalid, &token, &probability) == LM_ERR_ARGUMENT);
@@ -1962,6 +2111,9 @@ static void test_prefix_cache() {
     lm_prefix_cache *restored = nullptr;
     assert(lm_prefix_cache_create(2u, 8u, &restored) == LM_OK);
     assert(lm_prefix_cache_import(restored, serialized.data(), serialized.size()) == LM_OK);
+    std::vector<unsigned char> unaligned(serialized.size() + 1u, 0u);
+    std::memcpy(unaligned.data() + 1u, serialized.data(), serialized.size());
+    assert(lm_prefix_cache_import(restored, unaligned.data() + 1u, serialized.size()) == LM_OK);
     assert(lm_prefix_cache_lookup(restored, 11u, 22u, other, 1u, &page, &prefix_tokens) == LM_OK && page == 12u);
     serialized[0] = 'X';
     assert(lm_prefix_cache_import(restored, serialized.data(), serialized.size()) == LM_ERR_PARSE);
@@ -2292,6 +2444,7 @@ int main() {
     test_model_and_cpu_math();
     test_safetensors_parser();
     test_safetensors_native_mlp();
+    test_safetensors_tied_output();
     test_safetensors_f16_bf16_matvec();
     test_safetensors_f16_bf16_inference();
     test_model_bound_f32_router();

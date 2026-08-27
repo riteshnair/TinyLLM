@@ -344,6 +344,8 @@ static lm_status run_native_generation(const lm_config &config, const generation
     generation.sampling = assets.sampling;
     generation.max_new_tokens = max_new_tokens;
     generation.prefill_chunk_tokens = assets.prefill_chunk_tokens;
+    generation.trace_sink = config.trace ? text_probe : nullptr;
+    generation.trace_user = nullptr;
     size_t generated_bytes = 0u;
     if (callback) {
         if (result || result_bytes) { lm_model_close(model); return LM_ERR_ARGUMENT; }

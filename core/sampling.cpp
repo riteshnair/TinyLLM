@@ -45,6 +45,26 @@ void lm_sampling_config_init(lm_sampling_config *config) {
     config->seed = 1u;
 }
 
+lm_status lm_logits_allowlist_processor(void *user, float *logits, uint32_t vocab_size,
+                                        const uint32_t *, size_t) {
+    const lm_token_allowlist *allowlist = static_cast<const lm_token_allowlist *>(user);
+    if (!allowlist || !logits || vocab_size == 0u || allowlist->token_count == 0u ||
+        !allowlist->token_ids || allowlist->token_count > vocab_size) return LM_ERR_ARGUMENT;
+    for (size_t i = 0u; i < allowlist->token_count; ++i) {
+        const uint32_t token = allowlist->token_ids[i];
+        if (token >= vocab_size) return LM_ERR_RANGE;
+        for (size_t previous = 0u; previous < i; ++previous)
+            if (allowlist->token_ids[previous] == token) return LM_ERR_ARGUMENT;
+    }
+    for (uint32_t token = 0u; token < vocab_size; ++token) {
+        bool allowed = false;
+        for (size_t i = 0u; i < allowlist->token_count; ++i)
+            if (allowlist->token_ids[i] == token) { allowed = true; break; }
+        if (!allowed) logits[token] = -INFINITY;
+    }
+    return LM_OK;
+}
+
 lm_status lm_sample_logits(const float *logits, uint32_t vocab_size,
                            const lm_sampling_config *config, uint32_t *out_token,
                            float *out_probability) {
@@ -165,7 +185,8 @@ lm_status lm_sample_logits(const float *logits, uint32_t vocab_size,
         return LM_OK;
     }
     uint64_t random_state = config->seed;
-    const float unit = static_cast<float>(next_random(&random_state) >> 40u) /
+    uint64_t *random_state_ptr = config->rng_state ? config->rng_state : &random_state;
+    const float unit = static_cast<float>(next_random(random_state_ptr) >> 40u) /
                        static_cast<float>(1ull << 24u);
     float threshold = unit * total;
     for (size_t i = 0u; i < limit; ++i) {

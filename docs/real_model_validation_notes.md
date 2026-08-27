@@ -60,3 +60,9 @@ The newly exposed controls were also exercised from the repository root against 
 | Tiny random Llama SafeTensors F32, CPU | `--attention-window 2 --rope-scale 2 --prefill-chunk-tokens 1` | **PASS**, exit 0, `generated=ino película` |
 
 These controls are implemented in the narrow native path. Chunked prefill is a sequential bounded slice, not continuous-batch interleaving; sliding-window attention is currently CPU-side even when projection matvecs use Vulkan; and no discrete-GPU performance claim is made.
+
+## Trace and sampling repair evidence
+
+The repaired generation path was exercised from the repository root after adding generation-owned sampling history, an optional advancing deterministic RNG state, the reusable allowlist processor, synchronous generation trace events, and defensive failure-state handling. The traced real GGUF CPU run used `--trace --attention-window 2 --rope-scale 2 --prefill-chunk-tokens 1` and returned `generated=..` with ordered events `stage=1 bytes=4`, `stage=2 bytes=4`, `stage=3 bytes=4`, `stage=3 bytes=4`, and `stage=4 bytes=0`. The corresponding configured GGUF Vulkan/llvmpipe and standard-HF SafeTensors CPU runs also completed successfully with `generated=..` and `generated=ino película`, respectively.
+
+The unit suite additionally proves that native sampling processors observe history counts of 2, 3, and 4 across a three-token generation, that an explicitly supplied RNG state advances across repeated stochastic calls, that the allowlist processor masks only disallowed IDs, and that failed native generation calls leave the output count at zero. Prefix-cache import was tested with a deliberately unaligned serialized buffer.

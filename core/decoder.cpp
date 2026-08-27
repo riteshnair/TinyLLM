@@ -1,6 +1,7 @@
 #include "lm/lm.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -919,9 +920,14 @@ static lm_status lm_model_generate_native_impl(const lm_model_file *model,
         config->step.intermediate_size == 0u ||
         config->step.intermediate_size > kNativeProfileMaxIntermediate ||
         config->prefill_chunk_tokens > (1u << 20u) ||
+        config->sampling.history_count > (1u << 20u) ||
+        (config->sampling.history_count != 0u && !config->sampling.history_tokens) ||
         config->stop_string_count > 4u ||
         (config->has_stop_token && (config->stop_token >= config->step.vocab_size)))
         return LM_ERR_ARGUMENT;
+    *out_count = 0u;
+    for (size_t i = 0u; i < config->sampling.history_count; ++i)
+        if (config->sampling.history_tokens[i] >= config->step.vocab_size) return LM_ERR_RANGE;
     for (uint32_t i = 0u; i < config->stop_string_count; ++i)
         if (!config->stop_strings[i] || config->stop_strings[i][0] == '\0') return LM_ERR_ARGUMENT;
     if (callback && config->stop_string_count != 0u) return LM_ERR_UNSUPPORTED;
@@ -947,6 +953,21 @@ static lm_status lm_model_generate_native_impl(const lm_model_file *model,
             prompt_count = rolled_prompt.size();
         }
     }
+    std::vector<uint32_t> sampling_history;
+    try {
+        sampling_history.reserve(config->sampling.history_count + prompt_count + config->max_new_tokens);
+        if (config->sampling.history_count != 0u)
+            sampling_history.insert(sampling_history.end(), config->sampling.history_tokens,
+                                    config->sampling.history_tokens + config->sampling.history_count);
+        sampling_history.insert(sampling_history.end(), prompt_tokens, prompt_tokens + prompt_count);
+    } catch (const std::bad_alloc &) {
+        return LM_ERR_CAPACITY;
+    }
+    lm_sampling_config sampling = config->sampling;
+    uint64_t generation_rng_state = sampling.seed;
+    if (!sampling.rng_state) sampling.rng_state = &generation_rng_state;
+    sampling.history_tokens = sampling_history.data();
+    sampling.history_count = sampling_history.size();
     const uint32_t context_tokens = static_cast<uint32_t>(prompt_count) + config->max_new_tokens;
     const uint64_t kv_elements = (static_cast<uint64_t>(config->step.hidden_size) /
                                   config->step.head_count) * config->step.head_count_kv;
@@ -972,6 +993,20 @@ static lm_status lm_model_generate_native_impl(const lm_model_file *model,
         }
     };
     lm_status status = LM_OK;
+    uint64_t trace_id = 1u;
+    const auto emit_trace = [&](uint32_t stage, uint32_t bytes, uint32_t flags) {
+        if (!config->trace_sink) return;
+        lm_probe probe{};
+        probe.trace_id = trace_id++;
+        probe.kind = 1u;
+        probe.stage = stage;
+        probe.bytes = bytes;
+        probe.flags = flags;
+        probe.timestamp_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        config->trace_sink(config->trace_user, &probe);
+    };
+    emit_trace(1u, static_cast<uint32_t>(prompt_count * sizeof(uint32_t)), 0u);
     for (uint32_t layer = 0u; layer < graph->layer_count; ++layer) {
         if (config->use_typed_kv != 0u)
             status = lm_kv_cache_create_typed(1u, context_tokens, config->kv_dtype,
@@ -1006,18 +1041,22 @@ static lm_status lm_model_generate_native_impl(const lm_model_file *model,
                                                              packed_scratch, packed_scratch_bytes,
                                                              logits.data(), logits.size());
                 if (status != LM_OK) break;
+                emit_trace(2u, static_cast<uint32_t>(sizeof(uint32_t)), 0u);
             }
             chunk_start = chunk_end;
         }
-        *out_count = 0u;
         for (uint32_t i = 0u; status == LM_OK && i < config->max_new_tokens; ++i) {
             float probability = 0.0f;
             uint32_t next_token = 0u;
-            status = lm_sample_logits(logits.data(), config->step.vocab_size, &config->sampling,
+            sampling.history_tokens = sampling_history.data();
+            sampling.history_count = sampling_history.size();
+            status = lm_sample_logits(logits.data(), config->step.vocab_size, &sampling,
                                       &next_token, &probability);
             if (status != LM_OK) break;
             out_tokens[*out_count] = next_token;
+            emit_trace(3u, static_cast<uint32_t>(sizeof(uint32_t)), 0u);
             ++*out_count;
+            sampling_history.push_back(next_token);
             const size_t before_stop = *out_count;
             status = trim_stop_string(model, config, std::vector<uint32_t>(out_tokens, out_tokens + *out_count),
                                       out_count, &decoded_stop);
@@ -1044,6 +1083,7 @@ static lm_status lm_model_generate_native_impl(const lm_model_file *model,
         }
     }
     cleanup();
+    emit_trace(4u, 0u, status == LM_OK ? 0u : 1u);
     return status;
 }
 
@@ -1068,7 +1108,8 @@ lm_status lm_model_generate_native_stream(const lm_model_file *model,
                                           const uint32_t *prompt_tokens, size_t prompt_count,
                                           void *packed_scratch, uint64_t packed_scratch_bytes,
                                           lm_native_token_callback callback, void *user) {
-    if (!callback || !config || config->max_new_tokens == 0u) return LM_ERR_ARGUMENT;
+    if (!callback || !config || config->max_new_tokens == 0u ||
+        config->max_new_tokens > kMaxNativeGeneratedTokens) return LM_ERR_ARGUMENT;
     std::vector<uint32_t> tokens;
     try { tokens.resize(config->max_new_tokens); } catch (const std::bad_alloc &) { return LM_ERR_CAPACITY; }
     size_t count = 0u;
@@ -1089,7 +1130,7 @@ lm_status lm_model_generate_native_text(const lm_model_file *model,
         !out_text || !out_bytes || out_capacity == 0u) return LM_ERR_ARGUMENT;
     const size_t token_capacity = static_cast<size_t>(config->max_new_tokens);
     if (token_capacity == 0u || prompt_bytes == std::numeric_limits<size_t>::max() ||
-        config->max_new_tokens > kMaxNativeGeneratedTokens) return LM_ERR_ARGUMENT;
+        prompt_bytes > (1u << 20u) || config->max_new_tokens > kMaxNativeGeneratedTokens) return LM_ERR_ARGUMENT;
     std::vector<uint32_t> prompt_tokens;
     std::vector<uint32_t> generated;
     size_t prompt_count = 0u;

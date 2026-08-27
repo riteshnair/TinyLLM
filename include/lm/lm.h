@@ -477,9 +477,18 @@ typedef struct lm_sampling_config {
     size_t history_count;
     lm_logits_processor processor;
     void *processor_user;
+    /* Optional mutable state; when set, sampling advances it instead of reseeding every call. */
+    uint64_t *rng_state;
 } lm_sampling_config;
 
 void lm_sampling_config_init(lm_sampling_config *config);
+typedef struct lm_token_allowlist {
+    const uint32_t *token_ids;
+    size_t token_count;
+} lm_token_allowlist;
+/* Masks every token not present in the caller-owned allowlist to -INFINITY. */
+lm_status lm_logits_allowlist_processor(void *user, float *logits, uint32_t vocab_size,
+                                        const uint32_t *history_tokens, size_t history_count);
 lm_status lm_sample_logits(const float *logits, uint32_t vocab_size,
                            const lm_sampling_config *config, uint32_t *out_token,
                            float *out_probability);
@@ -821,6 +830,9 @@ typedef struct lm_native_generation_config {
     uint32_t stop_string_count;
     /* 0 = one sequential prefill stream; otherwise split prompt work into chunks of at most N tokens. */
     uint32_t prefill_chunk_tokens;
+    /* Optional synchronous trace sink: kind=1, stages 1 begin, 2 prefill token, 3 decode token, 4 complete. */
+    lm_probe_sink trace_sink;
+    void *trace_user;
 } lm_native_generation_config;
 
 typedef lm_status (*lm_native_token_callback)(void *user, uint32_t token_id, float probability);

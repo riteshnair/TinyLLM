@@ -182,6 +182,8 @@ Use rolling windows, structured summaries, selective retrieval, and validated pr
 
 The narrow native attention contract is explicit: `attention_window=0` attends to all causal KV tokens; a positive value attends only to the last N tokens, including the current token, and reads that bounded range from the page. `rope_scale=0` or `1` preserves absolute positions; a positive value divides the absolute position before the standard RoPE rotation. This is a linear position policy, not NTK or dynamic scaling. `prefill_chunk_tokens=0` retains the existing sequential prompt loop; a positive value groups that same loop into bounded chunks without changing KV ownership or enabling cross-request interleaving.
 
+Sampling receives a generation-owned history consisting of configured prior tokens, the active prompt after any rolling policy, and previously generated tokens. An optional `rng_state` advances deterministic sampling across calls; when absent, a direct sampler call remains seed-deterministic. The built-in allowlist processor validates unique in-range IDs and masks all other logits to negative infinity. Native generation exposes synchronous probe stages for begin, prefill token, decode token, and completion; probe byte counts are token payload bytes and callbacks must remain non-blocking and caller-owned.
+
 KV quantization is an explicit codec policy. Begin with FP16/BF16, then Q8/Q6, and only then experimental Q4, KIVI-like, or TurboQuant-like codecs. Each codec declares its bit rate, scale metadata, encode/decode cost, supported kernels, error metric, and model/backend restrictions.
 
 ## 10. CPU and Vulkan execution

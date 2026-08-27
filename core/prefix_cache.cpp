@@ -196,9 +196,11 @@ lm_status lm_prefix_cache_import(lm_prefix_cache *cache, const void *data, size_
         if (token_count == 0u || token_count > cache->max_tokens ||
             token_count > remaining / sizeof(uint32_t)) return LM_ERR_PARSE;
         PrefixEntry entry{model_identity, settings_identity, static_cast<uint64_t>(i + 1u), page_id, {}};
-        try { entry.tokens.assign(reinterpret_cast<const uint32_t *>(cursor),
-                                  reinterpret_cast<const uint32_t *>(cursor) + token_count); }
-        catch (const std::bad_alloc &) { return LM_ERR_CAPACITY; }
+        try {
+            entry.tokens.resize(token_count);
+            for (uint32_t token = 0u; token < token_count; ++token)
+                entry.tokens[token] = get32(cursor + static_cast<size_t>(token) * sizeof(uint32_t));
+        } catch (const std::bad_alloc &) { return LM_ERR_CAPACITY; }
         imported.push_back(std::move(entry));
         cursor += static_cast<size_t>(token_count) * sizeof(uint32_t);
         remaining -= static_cast<size_t>(token_count) * sizeof(uint32_t);
